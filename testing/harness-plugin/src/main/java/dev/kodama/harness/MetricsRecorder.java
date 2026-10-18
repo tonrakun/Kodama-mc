@@ -10,6 +10,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityRemoveEvent;
 import org.bukkit.entity.LivingEntity;
@@ -69,6 +70,8 @@ final class MetricsRecorder implements Listener {
 
     private long deaths;
     private long dropItems;
+    private long fallDeaths;
+    private long fallDropItems;
     private final Map<String, long[]> despawnsByType = new LinkedHashMap<>();
 
     private volatile boolean recording;
@@ -150,9 +153,17 @@ final class MetricsRecorder implements Listener {
             return;
         }
         deaths++;
+        boolean fall = e.getEntity().getLastDamageCause() != null
+                && e.getEntity().getLastDamageCause().getCause() == EntityDamageEvent.DamageCause.FALL;
+        if (fall) {
+            fallDeaths++;
+        }
         for (ItemStack s : e.getDrops()) {
             if (s != null) {
                 dropItems += s.getAmount();
+                if (fall) {
+                    fallDropItems += s.getAmount();
+                }
             }
         }
     }
@@ -325,6 +336,8 @@ final class MetricsRecorder implements Listener {
         Map<String, Object> drops = new LinkedHashMap<>();
         drops.put("deaths", deaths);
         drops.put("items", dropItems);
+        drops.put("fallDeaths", fallDeaths);
+        drops.put("fallItems", fallDropItems);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("server", Bukkit.getName());

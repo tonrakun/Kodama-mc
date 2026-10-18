@@ -32,6 +32,7 @@ export const ROWS = [
   { id: 'explorerSpeed', label: 'Explorer speed (blocks/s)', get: (_, b) => num(b?.explorerSpeedAvg), digits: 1 },
   { id: 'mobs', label: 'Mobs (living, non-player)', get: (m) => num(m.mobs?.total), digits: 0 },
   { id: 'despawns', label: 'Despawns', get: (m) => num(m.mobs?.despawns), digits: 0 },
+  { id: 'fallDeaths', label: 'Fall deaths (trap tower)', get: (m) => num(m.drops?.fallDeaths), digits: 0 },
   { id: 'entities', label: 'Entities', get: (m) => sumWorlds(m, 'entities'), digits: 0 },
 ];
 

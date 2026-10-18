@@ -19,7 +19,8 @@ Common options:
 bench options:
   --server paper|kodama|both Servers to run, sequentially (both)
   --bots <n>                 (10)
-  --pattern settler|explorer|mixed (mixed)
+  --pattern settler|explorer|mixed|afk (mixed); afk bots stand still
+  --tower                    Build a trap tower above spawn, night locked, and park the bots next to it
   --duration <s>             Measured seconds (120)
   --warmup <s>               (30)
   --seed <string>            World seed (kodama)
@@ -60,6 +61,7 @@ const options = {
   'pregen-radius': { type: 'string', default: '24' },
   'kodama-set': { type: 'string', multiple: true },
   'explorer-speed': { type: 'string', default: '30' },
+  tower: { type: 'boolean' },
   'server-cpus': { type: 'string', default: '0-7' },
   'bot-cpus': { type: 'string', default: '8-11' },
   'no-affinity': { type: 'boolean' },
@@ -114,6 +116,7 @@ async function main() {
       pregenRadius: number(values, 'pregen-radius', { min: 1 }),
       kodamaSet: values['kodama-set'] ?? [],
       explorerSpeed: number(values, 'explorer-speed', { min: 0, integer: false }),
+      tower: Boolean(values.tower),
       serverCpus: values['server-cpus'],
       botCpus: values['bot-cpus'],
       noAffinity: Boolean(values['no-affinity']),

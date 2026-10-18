@@ -61,7 +61,7 @@ function connect(st) {
     auth: 'offline',
     viewDistance: cfg.viewDistance,
     checkTimeoutInterval: 120000,
-    physicsEnabled: st.role === 'settler',
+    physicsEnabled: st.role !== 'explorer',
     // minecraft-protocol cannot fully parse some 1.20.6 registry/item data and dumps huge stack traces;
     // the bots do not use those packets.
     hideErrors: true,
@@ -144,6 +144,8 @@ function pickTarget(st) {
 }
 
 function startMoving(st) {
+  // afk bots stand where the harness put them (e.g. next to the trap tower)
+  if (st.role === 'afk') return;
   const pos = st.bot.entity.position;
   const a = (Math.PI * 2 * st.groupIndex) / st.groupSize;
   if (st.role === 'settler') {
@@ -249,7 +251,7 @@ function buildResult(endedAt) {
 
 // Explorers stop when the chunk ahead is not there yet, so slow chunk delivery shows up as lower speed.
 function explorerSpeed(inWindow, windowSeconds) {
-  const explorers = states.filter((st) => st.role !== 'settler' && st.spawned);
+  const explorers = states.filter((st) => st.role === 'explorer' && st.spawned);
   if (explorers.length === 0) return null;
   const dist = explorers.reduce((sum, st) => sum + (st.traveled ?? 0) - (inWindow ? st.traveledAtWindow ?? 0 : 0), 0);
   return dist / explorers.length / windowSeconds;

@@ -11,7 +11,7 @@ import { ensurePregenWorld } from './worlds.js';
 export async function runBench(o) {
   const names = o.server === 'both' ? ['paper', 'kodama'] : [o.server];
   if (!['paper', 'kodama', 'both'].includes(o.server)) throw new Error(`--server must be paper, kodama or both (got ${o.server})`);
-  if (!['settler', 'explorer', 'mixed'].includes(o.pattern)) throw new Error(`--pattern must be settler, explorer or mixed (got ${o.pattern})`);
+  if (!['settler', 'explorer', 'mixed', 'afk'].includes(o.pattern)) throw new Error(`--pattern must be settler, explorer, mixed or afk (got ${o.pattern})`);
   if (o.failOnRegression !== null && names.length !== 2) throw new Error('--fail-on-regression requires --server both');
 
   // Fail before the long world generation if a jar is unavailable.

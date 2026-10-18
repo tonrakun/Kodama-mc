@@ -24,6 +24,7 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
     private String botPrefix;
     private MetricsRecorder metrics;
     private Pregenerator pregen;
+    private TrapTower tower;
 
     @Override
     public void onEnable() {
@@ -52,6 +53,10 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
         if (e.getType() != ServerLoadEvent.LoadType.STARTUP) {
             return;
         }
+        if (Boolean.getBoolean(P + "tower")) {
+            tower = new TrapTower(TrapTower.createVoidWorld("harness_tower"));
+            tower.build();
+        }
         String mode = System.getProperty(P + "mode");
         if ("pregen".equals(mode)) {
             startPregen(intProp("radius", 16), true);
@@ -70,6 +75,9 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
             p.setGameMode(GameMode.CREATIVE);
             p.setAllowFlight(true);
             p.setOp(true);
+            if (tower != null) {
+                tower.park(p);
+            }
         }
     }
 
