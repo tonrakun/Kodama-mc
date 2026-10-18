@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kevin Raneri <kevin.raneri@gmail.com>
+Date: Wed, 10 Nov 2021 00:37:03 -0500
+Subject: [PATCH] Pufferfish: Optimize mob spawning
+
+Original license: GPL v3
+Original project: https://github.com/pufferfish-gg/Pufferfish
+
+This patch aims to reduce the main-thread impact of mob spawning by
+offloading as much work as possible to other threads. It is possible for
+inconsistencies to come up, but when they happen they never interfere
+with the server's operation (they don't produce errors), and side
+effects are limited to more or less mobs being spawned in any particular
+tick.
+
+It is possible to disable this optimization if it is not required or if
+it interferes with any plugins. On servers with thousands of entities,
+this can result in performance gains of up to 15%, which is significant
+and, in my opinion, worth the low risk of minor mob-spawning-related
+inconsistencies.
+
+Imported into Kodama from Leaf (https://github.com/Winds-Studio/Leaf) @ becd099200691927e35a419c9534835db7bf8b31, patch 0007-Pufferfish-Optimize-mob-spawning.patch.
+Original license: GPL v3 (Pufferfish; stated in the patch header).
+Kodama changes: Leaf's AsyncMobSpawning config module replaced by async.mob-spawning.enabled (restart required, read once at startup) via dev.kodama.async.AsyncSettings; offloading only applies with per-player mob spawns, and a failed count reports to the async-mob-spawning FeatureGuard and re-arms the next count.
+
+diff --git a/src/main/java/dev/kodama/async/AsyncSettings.java b/src/main/java/dev/kodama/async/AsyncSettings.java
+index 86c77ec22b176fd7aecc1ebcf690b8b2908ec11e..3ccd0ae94655335ecd230c307a3237d2c58d9a97 100644
+--- a/src/main/java/dev/kodama/async/AsyncSettings.java
++++ b/src/main/java/dev/kodama/async/AsyncSettings.java
+@@ -10,6 +10,9 @@ import org.checkerframework.checker.nullness.qual.Nullable;
+ public final class AsyncSettings {
+ 
+     public static final String PATHFINDING = "async-pathfinding";
++    public static final String MOB_SPAWNING = "async-mob-spawning";
++
++    private static volatile boolean mobSpawningEnabled; // read once by latchAsyncMobSpawning
+ 
+     private static final ThreadLocal<Boolean> FORCE_SYNC_PATHFINDING = new ThreadLocal<>();
+ 
+@@ -51,6 +54,23 @@ public final class AsyncSettings {
+         void close();
+     }
+ 
++    /**
++     * Reads the startup value of {@code async.mob-spawning.enabled}. Only the server startup calls this, right where it
++     * decides whether to start the mob spawning thread, so a reload can never enable offloading without that thread.
++     */
++    public static boolean latchAsyncMobSpawning() {
++        final KodamaGlobalConfiguration.Async section = section();
++        mobSpawningEnabled = section != null && section.mobSpawning.enabled.isTrue();
++        return mobSpawningEnabled;
++    }
++
++    /**
++     * Whether mob counting is offloaded: the startup value, unless the {@link FeatureGuard} has switched it off.
++     */
++    public static boolean asyncMobSpawning() {
++        return mobSpawningEnabled && !FeatureGuard.isTripped(MOB_SPAWNING);
++    }
++
+     /**
+      * Read once when the pathfinding executor is created.
+      */
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index 5b24d5ed2c4000f56fbd5f99425bfeb6ee0c2cb2..8fea27f163f07067dd94e1a2515b8b8ef97a3762 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -142,6 +142,15 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+             @Constraint(Constraints.Positive.class)
+             public int keepalive = 60;
+         }
++
++        @Comment("Offloads the mob counting that natural mob spawning needs to a background thread. Needs per-player-mob-spawns in the Paper config; mob caps and spawn rules stay the same.")
++        public MobSpawning mobSpawning;
++
++        public class MobSpawning extends ConfigurationPart {
++            @RestartRequired
++            @Comment("Enables asynchronous mob counting. Read once at startup. Counts may be one tick old, so a world can spawn slightly more or fewer mobs in a single tick.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++        }
+     }
+ 
+     @Comment("Background pre-caching of chunk data.")
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 0dd8e3a9d690737dd9ea10ef3062dc263ab43646..655ac260dcdb08e8d32fbed9e3c8b75f480b06c0 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -318,6 +318,8 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     public volatile boolean abnormalExit = false; // Paper
+     public static final long SERVER_INIT = System.nanoTime(); // Paper - Lag compensation
+ 
++    public gg.pufferfish.pufferfish.util.AsyncExecutor mobSpawnExecutor = new gg.pufferfish.pufferfish.util.AsyncExecutor("MobSpawning"); // Pufferfish - optimize mob spawning
++
+     public static <S extends MinecraftServer> S spin(Function<Thread, S> serverFactory) {
+         AtomicReference<S> atomicreference = new AtomicReference();
+         Thread thread = new io.papermc.paper.util.TickThread(() -> { // Paper - rewrite chunk system
+diff --git a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index 9a7ed048465bad08a5cd9dadd91cae9ea155ffe1..d887cd50fa0bf583fcc6c60aaa2eb9d2615f86f8 100644
+--- a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -358,6 +358,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+                 DedicatedServer.LOGGER.info("JMX monitoring enabled");
+             }
+ 
++            if (dev.kodama.async.AsyncSettings.latchAsyncMobSpawning()) mobSpawnExecutor.start(); // Pufferfish // Kodama
+             return true;
+         }
+     }
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index b1301d9b6467ba8700e4d86a8fe83fa48ec829e0..6924a55ee8536cfa128d5a718c63bbf216b43941 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -246,7 +246,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+     // Paper end
+     // Paper start - optimise chunk tick iteration
+     public final it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<ChunkHolder> needsChangeBroadcasting = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>();
+-    public final com.destroystokyo.paper.util.misc.PlayerAreaMap playerMobSpawnMap = new com.destroystokyo.paper.util.misc.PlayerAreaMap(this.pooledLinkedPlayerHashSets);
++    public final com.destroystokyo.paper.util.misc.PlayerAreaMap playerMobSpawnMap = new gg.pufferfish.pufferfish.util.AsyncPlayerAreaMap(this.pooledLinkedPlayerHashSets); // Pufferfish
+     // Paper end - optimise chunk tick iteration
+ 
+     public ChunkMap(ServerLevel world, LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer, StructureTemplateManager structureTemplateManager, Executor executor, BlockableEventLoop<Runnable> mainThreadExecutor, LightChunkGetter chunkProvider, ChunkGenerator chunkGenerator, ChunkProgressListener worldGenerationProgressListener, ChunkStatusUpdateListener chunkStatusChangeListener, Supplier<DimensionDataStorage> persistentStateManagerFactory, int viewDistance, boolean dsync) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 65e22993f383ae28d6ccdfd55258a5659c69978e..657f60456bc8bc3ae0a24763de2ec1e247648680 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -65,7 +65,7 @@ public class ServerChunkCache extends ChunkSource {
+     private final ChunkAccess[] lastChunk = new ChunkAccess[4];
+     @Nullable
+     @VisibleForDebug
+-    private NaturalSpawner.SpawnState lastSpawnState;
++    private volatile NaturalSpawner.SpawnState lastSpawnState; // Kodama - written by the mob spawning thread
+     // Paper start
+     public final io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<LevelChunk> tickingChunks = new io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<>(4096, 0.75f, 4096, 0.15, true);
+     public final io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<LevelChunk> entityTickingChunks = new io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<>(4096, 0.75f, 4096, 0.15, true);
+@@ -75,6 +75,9 @@ public class ServerChunkCache extends ChunkSource {
+     private final LevelChunk[] lastLoadedChunks = new LevelChunk[4 * 4];
+     // Paper end
+ 
++    public boolean firstRunSpawnCounts = true; // Pufferfish
++    public final java.util.concurrent.atomic.AtomicBoolean _pufferfish_spawnCountsReady = new java.util.concurrent.atomic.AtomicBoolean(false); // Pufferfish - optimize countmobs
++
+     public ServerChunkCache(ServerLevel world, LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer, StructureTemplateManager structureTemplateManager, Executor workerExecutor, ChunkGenerator chunkGenerator, int viewDistance, int simulationDistance, boolean dsync, ChunkProgressListener worldGenerationProgressListener, ChunkStatusUpdateListener chunkStatusChangeListener, Supplier<DimensionDataStorage> persistentStateManagerFactory) {
+         this.level = world;
+         this.mainThreadProcessor = new ServerChunkCache.MainThreadExecutor(world);
+@@ -501,6 +504,10 @@ public class ServerChunkCache extends ChunkSource {
+         long j = i - this.lastInhabitedUpdate;
+ 
+         this.lastInhabitedUpdate = i;
++        // Kodama start - read once per tick; the offloaded counting only exists for per-player mob spawns, every other mode keeps counting on the tick thread
++        final boolean asyncMobSpawning = dev.kodama.async.AsyncSettings.asyncMobSpawning()
++            && (this.spawnFriendlies || this.spawnEnemies) && this.level.paperConfig().entities.spawning.perPlayerMobSpawns;
++        // Kodama end
+         if (!this.level.isDebug()) {
+             ProfilerFiller gameprofilerfiller = this.level.getProfiler();
+ 
+@@ -517,8 +524,8 @@ public class ServerChunkCache extends ChunkSource {
+                 int k = this.distanceManager.getNaturalSpawnChunkCount();
+                 // Paper start - Optional per player mob spawns
+                 int naturalSpawnChunkCount = k;
+-                NaturalSpawner.SpawnState spawnercreature_d; // moved down
+                 if ((this.spawnFriendlies || this.spawnEnemies) && this.level.paperConfig().entities.spawning.perPlayerMobSpawns) { // don't count mobs when animals and monsters are disabled
++                    if (!asyncMobSpawning) { // Pufferfish - moved down when async processing // Kodama
+                     // re-set mob counts
+                     for (ServerPlayer player : this.level.players) {
+                         // Paper start - per player mob spawning backoff
+@@ -533,14 +540,18 @@ public class ServerChunkCache extends ChunkSource {
+                         }
+                         // Paper end - per player mob spawning backoff
+                     }
+-                    spawnercreature_d = NaturalSpawner.createState(naturalSpawnChunkCount, this.level.getAllEntities(), this::getFullChunk, null, true);
++                    lastSpawnState = NaturalSpawner.createState(naturalSpawnChunkCount, this.level.getAllEntities(), this::getFullChunk, null, true); // Pufferfish - async mob spawning
++                    } // Pufferfish - (endif) moved down when async processing
+                 } else {
+-                    spawnercreature_d = NaturalSpawner.createState(naturalSpawnChunkCount, this.level.getAllEntities(), this::getFullChunk, !this.level.paperConfig().entities.spawning.perPlayerMobSpawns ? new LocalMobCapCalculator(this.chunkMap) : null, false);
++                    // Pufferfish start - async mob spawning
++                    lastSpawnState = NaturalSpawner.createState(naturalSpawnChunkCount, this.level.getAllEntities(), this::getFullChunk, !this.level.paperConfig().entities.spawning.perPlayerMobSpawns ? new LocalMobCapCalculator(this.chunkMap) : null, false);
++                    _pufferfish_spawnCountsReady.set(true);
++                    // Pufferfish end
+                 }
+                 // Paper end - Optional per player mob spawns
+                 this.level.timings.countNaturalMobs.stopTiming(); // Paper - timings
+ 
+-                this.lastSpawnState = spawnercreature_d;
++                //this.lastSpawnState = spawnercreature_d; // Pufferfish - this is managed asynchronously
+                 gameprofilerfiller.popPush("spawnAndTick");
+                 boolean flag = this.level.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && !this.level.players().isEmpty(); // CraftBukkit
+ 
+@@ -630,8 +641,8 @@ public class ServerChunkCache extends ChunkSource {
+                     if (tick && chunk1.chunkStatus.isOrAfter(net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING)) {
+                         // Paper end - optimise chunk tick iteration
+                         chunk1.incrementInhabitedTime(j);
+-                        if (spawn && flag && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkcoordintpair)) { // Spigot // Paper - optimise chunk tick iteration
+-                            NaturalSpawner.spawnForChunk(this.level, chunk1, spawnercreature_d, this.spawnFriendlies, this.spawnEnemies, flag1);
++                        if (spawn && flag && (!asyncMobSpawning || _pufferfish_spawnCountsReady.get()) && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkcoordintpair)) { // Spigot // Paper - optimise chunk tick iteration // Pufferfish // Kodama
++                            NaturalSpawner.spawnForChunk(this.level, chunk1, lastSpawnState, this.spawnFriendlies, this.spawnEnemies, flag1); // Pufferfish
+                         }
+ 
+                         if (true || this.level.shouldTickBlocksAt(chunkcoordintpair.toLong())) { // Paper - optimise chunk tick iteration
+@@ -678,6 +689,46 @@ public class ServerChunkCache extends ChunkSource {
+             gameprofilerfiller.pop();
+             gameprofilerfiller.pop();
+         }
++
++        // Pufferfish start - optimize mob spawning
++        if (asyncMobSpawning) { // Kodama
++            for (ServerPlayer player : this.level.players) {
++                // Paper start - per player mob spawning backoff
++                for (int ii = 0; ii < ServerPlayer.MOBCATEGORY_TOTAL_ENUMS; ii++) {
++                    player.mobCounts[ii] = 0;
++
++                    int newBackoff = player.mobBackoffCounts[ii] - 1; // TODO make configurable bleed // TODO use nonlinear algorithm?
++                    if (newBackoff < 0) {
++                        newBackoff = 0;
++                    }
++                    player.mobBackoffCounts[ii] = newBackoff;
++                }
++                // Paper end - per player mob spawning backoff
++            }
++            if (firstRunSpawnCounts) {
++                firstRunSpawnCounts = false;
++                _pufferfish_spawnCountsReady.set(true);
++            }
++            if (_pufferfish_spawnCountsReady.getAndSet(false)) {
++                net.minecraft.server.MinecraftServer.getServer().mobSpawnExecutor.submit(() -> {
++                    io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet.Iterator<Entity> objectiterator = null; // Kodama
++                    try { // Kodama - the next count must be requested even when this one failed
++                    int mapped = distanceManager.getNaturalSpawnChunkCount();
++                    objectiterator = // Kodama
++                            level.entityTickList.entities.iterator(io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet.ITERATOR_FLAG_SEE_ADDITIONS);
++                    gg.pufferfish.pufferfish.util.IterableWrapper<Entity> wrappedIterator =
++                            new gg.pufferfish.pufferfish.util.IterableWrapper<>(objectiterator);
++                    lastSpawnState = NaturalSpawner.createState(mapped, wrappedIterator, this::getFullChunk, null, true);
++                    } catch (Exception e) { // Kodama
++                        dev.kodama.feature.FeatureGuard.reportFailure(dev.kodama.async.AsyncSettings.MOB_SPAWNING, e); // Kodama
++                    } finally { // Kodama
++                    if (objectiterator != null) objectiterator.finishedIterating(); // Kodama
++                    _pufferfish_spawnCountsReady.set(true);
++                    } // Kodama
++                });
++            }
++        }
++        // Pufferfish end
+     }
+ 
+     private void getFullChunk(long pos, Consumer<LevelChunk> chunkConsumer) {
+diff --git a/src/main/java/net/minecraft/world/level/entity/EntityTickList.java b/src/main/java/net/minecraft/world/level/entity/EntityTickList.java
+index 83a39f900551e39d5af6f17a339a386ddee4feef..0c8c534fc69172387f188af5282accfed7597ac7 100644
+--- a/src/main/java/net/minecraft/world/level/entity/EntityTickList.java
++++ b/src/main/java/net/minecraft/world/level/entity/EntityTickList.java
+@@ -9,7 +9,7 @@ import javax.annotation.Nullable;
+ import net.minecraft.world.entity.Entity;
+ 
+ public class EntityTickList {
+-    private final io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<Entity> entities = new io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<>(true); // Paper - rewrite this, always keep this updated - why would we EVER tick an entity that's not ticking?
++    public final io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<Entity> entities = new io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet<>(true); // Paper - rewrite this, always keep this updated - why would we EVER tick an entity that's not ticking? // Pufferfish - private->public
+ 
+     private void ensureActiveIsNotIterated() {
+         // Paper - replace with better logic, do not delay removals
