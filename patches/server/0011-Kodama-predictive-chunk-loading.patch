@@ -1,0 +1,1443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 15:40:27 +0900
+Subject: [PATCH] Kodama: predictive chunk loading
+
+Adds the first chunk loading features, all behind chunk-loading.* and
+exact Paper behavior when disabled:
+
+- A: PlayerMotion tracks smoothed velocity, heading and five minute
+  window statistics (new chunks per minute, average speed, elytra and
+  vehicle share, bounding range) for every player.
+- B: directional priority orders the player chunk loader queues by
+  manhattan distance weighted by the movement direction; the heading
+  snapshot only changes while the queues are empty, and a change of
+  heading sector or speed tier forces a rebuild.
+- C: delayed unload keeps chunks that left the load range loaded (full,
+  not ticking) for a configurable time through a lifespan ticket type,
+  bounded per world.
+- D: predictive prefetch generates chunks in a fan ahead of fast moving
+  players and around the landing spot of thrown ender pearls with low
+  priority, limited per player and per tick.
+
+/kodama status lists the ticket counts per world and the motion of every
+online player. Every feature falls back to the vanilla path through
+FeatureGuard.
+
+License: GPL-3.0
+
+diff --git a/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java b/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0dc32ea792706cfa0c518e7be8f68ad356bf2ef
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java
+@@ -0,0 +1,99 @@
++package dev.kodama.chunk;
++
++import dev.kodama.config.KodamaGlobalConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Read-only view of the {@code chunk-loading} section with the master switch and the {@link FeatureGuard} state already
++ * applied. Every call reads the live configuration, so callers that must not change behavior while queued state exists
++ * (the priority queues) take a snapshot themselves.
++ */
++public final class ChunkLoadingSettings {
++
++    public static final String PRIORITY = "chunk-priority";
++    public static final String PREFETCH = "chunk-prefetch";
++    public static final String UNLOAD_DELAY = "chunk-unload-delay";
++
++    private ChunkLoadingSettings() {
++    }
++
++    private static KodamaGlobalConfiguration.@Nullable ChunkLoading section() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null ? null : config.chunkLoading;
++    }
++
++    /**
++     * The master switch; also gates the player motion tracker.
++     */
++    public static boolean masterEnabled() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section != null && section.enabled.isTrue();
++    }
++
++    public static boolean priorityEnabled() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section != null && section.enabled.isTrue() && section.priority.enabled.isTrue() && !FeatureGuard.isTripped(PRIORITY);
++    }
++
++    public static double directionWeight() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0.0 : Math.max(0.0, section.priority.directionWeight.getAsDouble());
++    }
++
++    public static boolean unloadDelayEnabled() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section != null && section.enabled.isTrue() && section.unloadDelay.enabled.isTrue()
++            && section.unloadDelay.unloadDelaySeconds.getAsInt() > 0 && !FeatureGuard.isTripped(UNLOAD_DELAY);
++    }
++
++    public static int unloadDelayTicks() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0 : Math.max(0, section.unloadDelay.unloadDelaySeconds.getAsInt()) * 20;
++    }
++
++    public static int unloadDelayMaxChunks() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0 : Math.max(0, section.unloadDelay.unloadDelayMaxChunks.getAsInt());
++    }
++
++    public static boolean prefetchEnabled() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section != null && section.enabled.isTrue() && section.prefetch.enabled.isTrue() && !FeatureGuard.isTripped(PREFETCH);
++    }
++
++    public static boolean pearlPrefetchEnabled() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return prefetchEnabled() && section.prefetchPearls.isTrue();
++    }
++
++    public static double prefetchSecondsPerSpeed() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0.0 : section.prefetch.prefetchSecondsPerSpeed.getAsDouble();
++    }
++
++    public static double prefetchMaxSeconds() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0.0 : section.prefetch.prefetchMaxSeconds.getAsDouble();
++    }
++
++    public static int prefetchAngleDegrees() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0 : Math.max(0, Math.min(90, section.prefetch.prefetchAngle.getAsInt()));
++    }
++
++    public static int prefetchTicketTicks() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0 : Math.max(0, section.prefetch.prefetchTicketSeconds.getAsInt()) * 20;
++    }
++
++    public static int prefetchMaxInflight() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0 : Math.max(0, section.prefetch.prefetchMaxInflight.getAsInt());
++    }
++
++    public static int prefetchMaxPerTick() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null ? 0 : Math.max(0, section.prefetch.prefetchMaxPerTick.getAsInt());
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java b/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..23af3afc47be8956b4da9f0aa8e95f276b901d86
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
+@@ -0,0 +1,72 @@
++package dev.kodama.chunk;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader;
++import java.util.Locale;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.TextComponent;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++/**
++ * The {@code /kodama status} lines of the chunk loading features.
++ */
++public final class ChunkLoadingStatus {
++
++    private ChunkLoadingStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Chunk tickets";
++            }
++
++            @Override
++            public Component describe() {
++                TextComponent result = text("");
++                for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                    final KodamaChunkTickets tickets = level.playerChunkLoader.kodamaTickets;
++                    result = result.append(text("\n  " + level.getWorld().getName() + ": ", WHITE))
++                        .append(text("prefetch " + tickets.prefetchCount() + ", unload-delay " + tickets.unloadDelayCount(), GRAY));
++                }
++                return result;
++            }
++        });
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Player motion";
++            }
++
++            @Override
++            public Component describe() {
++                TextComponent result = text("");
++                boolean any = false;
++                for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                    for (final ServerPlayer player : level.players()) {
++                        final RegionizedPlayerChunkLoader.PlayerChunkLoaderData loader = player.chunkLoader;
++                        if (loader == null) {
++                            continue;
++                        }
++                        any = true;
++                        final PlayerMotion motion = loader.kodamaMotion();
++                        result = result.append(text("\n  " + player.getScoreboardName() + ": ", WHITE)).append(text(
++                            String.format(Locale.ROOT, "%.1f b/s, heading %.2f/%.2f, %.1f new chunks/min, avg %.1f b/s, elytra %d%%, vehicle %d%%, range %.0f blocks, prefetch in flight %d",
++                                motion.speedBlocksPerSecond(), motion.headingX(), motion.headingZ(), motion.newChunksPerMinute(),
++                                motion.averageSpeed() * 20.0, Math.round(motion.elytraFraction() * 100.0), Math.round(motion.vehicleFraction() * 100.0),
++                                motion.boundingRange(), loader.kodamaPrefetcher().inFlight()), GRAY));
++                    }
++                }
++                return any ? result : text("no players", GRAY);
++            }
++        });
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java b/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9e04ef375211c801909945bf6ec57c1d60145ec
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java
+@@ -0,0 +1,224 @@
++package dev.kodama.chunk;
++
++import ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor;
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader;
++import io.papermc.paper.chunk.system.scheduling.ChunkHolderManager;
++import io.papermc.paper.util.CoordinateUtils;
++import it.unimi.dsi.fastutil.longs.LongArrayList;
++import java.util.Arrays;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.level.GameRules;
++
++/**
++ * Predictive chunk prefetch of one player: generates the chunks in a fan in front of a fast moving player, beyond what
++ * the vanilla loader already loads, with low priority. One instance per player chunk loader, main thread only.
++ */
++public final class ChunkPrefetcher {
++
++    private static final int SCAN_INTERVAL_TICKS = 5;
++    private static final double MIN_SPEED = 0.05; // blocks per tick, a standing player never prefetches
++    private static final int MAX_CANDIDATES = 1 << 20;
++    // The prefetch only uses spare capacity: while the player's own chunk work is above this, the chunk system is
++    // already busy with chunks the player needs now and extra generation would only compete with it.
++    private static final int OWN_WORK_LIMIT = 8;
++
++    // budget shared by all players: tickets started in the current tick
++    private static long budgetTick = Long.MIN_VALUE;
++    private static int budgetUsed;
++
++    private final LongArrayList inFlight = new LongArrayList();
++    private final LongArrayList candidates = new LongArrayList();
++    private long[] sortBuffer = new long[256];
++    private long nextScanTick;
++
++    /**
++     * Number of prefetched chunks of this player that are still being generated.
++     */
++    public int inFlight() {
++        return this.inFlight.size();
++    }
++
++    /**
++     * Whether a player may cause chunks to be generated, the same rule as the vanilla player chunk loader.
++     */
++    public static boolean canGenerateChunks(final ServerLevel world, final ServerPlayer player) {
++        return !player.isSpectator() || world.getGameRules().getBoolean(GameRules.RULE_SPECTATORSGENERATECHUNKS);
++    }
++
++    /**
++     * Called by the player chunk loader after its own queues were processed.
++     *
++     * @param loadRadius the square radius, in chunks, around the player that the vanilla loader loads
++     * @param ownWork    number of chunks the vanilla loader currently loads or generates for this player
++     */
++    public void tick(final ServerLevel world, final ServerPlayer player, final PlayerMotion motion, final int centerX, final int centerZ,
++                     final int loadRadius, final boolean canGenerate, final int ownWork) {
++        final long now = MinecraftServer.currentTickLong;
++        final KodamaChunkTickets tickets = world.playerChunkLoader.kodamaTickets;
++
++        this.pruneInFlight(world, tickets, now);
++        if (!ChunkLoadingSettings.prefetchEnabled()) {
++            this.inFlight.clear(); // the tickets expire on their own
++            return;
++        }
++        if (now < this.nextScanTick || !canGenerate || ownWork > OWN_WORK_LIMIT) {
++            return;
++        }
++        this.nextScanTick = now + SCAN_INTERVAL_TICKS;
++
++        final double speed = motion.speed();
++        if (speed < MIN_SPEED) {
++            return;
++        }
++
++        int slots = ChunkLoadingSettings.prefetchMaxInflight() - this.inFlight.size();
++        if (budgetTick != now) {
++            budgetTick = now;
++            budgetUsed = 0;
++        }
++        slots = Math.min(slots, ChunkLoadingSettings.prefetchMaxPerTick() - budgetUsed);
++        if (slots <= 0) {
++            return;
++        }
++
++        // predicted position = position + velocity * lookahead; the fan reaches up to that distance
++        final double lookaheadSeconds = Math.min(Math.max(speed * 20.0 * ChunkLoadingSettings.prefetchSecondsPerSpeed(), 0.0),
++            ChunkLoadingSettings.prefetchMaxSeconds());
++        final double lookaheadChunks = speed * lookaheadSeconds * 20.0 / 16.0;
++        final int reach = (int)Math.floor(lookaheadChunks + 0.5);
++        if (reach <= 0) {
++            return;
++        }
++
++        final int ticketTicks = ChunkLoadingSettings.prefetchTicketTicks();
++        if (ticketTicks <= 0) {
++            return;
++        }
++
++        this.collectCandidates(world, tickets, motion, centerX, centerZ, loadRadius, reach, ticketTicks, now);
++        final int selected = Math.min(slots, this.candidates.size());
++        if (selected <= 0) {
++            return;
++        }
++
++        final long[] chosen = new long[selected];
++        for (int i = 0; i < selected; i++) {
++            chosen[i] = this.candidates.getLong(sortedIndex(this.sortBuffer[i]));
++            this.inFlight.add(chosen[i]);
++        }
++        budgetUsed += selected;
++        requestChunks(world, chosen, selected, ticketTicks);
++    }
++
++    private void pruneInFlight(final ServerLevel world, final KodamaChunkTickets tickets, final long now) {
++        for (int i = this.inFlight.size() - 1; i >= 0; i--) {
++            final long chunk = this.inFlight.getLong(i);
++            final boolean done = world.chunkSource.getChunkAtIfLoadedMainThreadNoCache(CoordinateUtils.getChunkX(chunk), CoordinateUtils.getChunkZ(chunk)) != null
++                || tickets.prefetchRemaining(chunk, now) <= 0L;
++            if (done) {
++                this.inFlight.set(i, this.inFlight.getLong(this.inFlight.size() - 1));
++                this.inFlight.removeLong(this.inFlight.size() - 1);
++            }
++        }
++    }
++
++    /**
++     * Fills {@link #candidates} with the chunks of the fan and {@link #sortBuffer} with their packed sort keys, nearest
++     * first. Only the first {@code candidates.size()} entries of the buffer are valid.
++     */
++    private void collectCandidates(final ServerLevel world, final KodamaChunkTickets tickets, final PlayerMotion motion, final int centerX,
++                                   final int centerZ, final int loadRadius, final int reach, final int ticketTicks, final long now) {
++        this.candidates.clear();
++        final double cosHalfAngle = Math.cos(Math.toRadians(ChunkLoadingSettings.prefetchAngleDegrees()));
++        final double headingX = motion.headingX();
++        final double headingZ = motion.headingZ();
++        final int maxDistance = loadRadius + reach;
++        final long refreshBelow = ticketTicks / 2;
++        int count = 0;
++
++        for (int dz = -maxDistance; dz <= maxDistance; dz++) {
++            final boolean innerRow = Math.abs(dz) <= loadRadius;
++            for (int dx = -maxDistance; dx <= maxDistance; dx++) {
++                if (innerRow && Math.abs(dx) <= loadRadius) {
++                    dx = loadRadius; // inside the area the vanilla loader handles, jump to its edge
++                    continue;
++                }
++                final double distanceSquared = (double)dx * dx + (double)dz * dz;
++                if ((dx * headingX + dz * headingZ) < cosHalfAngle * Math.sqrt(distanceSquared)) {
++                    continue;
++                }
++                final int chunkX = centerX + dx;
++                final int chunkZ = centerZ + dz;
++                if (!world.getWorldBorder().isChunkInBounds(chunkX, chunkZ)) {
++                    continue;
++                }
++                final long chunk = CoordinateUtils.getChunkKey(chunkX, chunkZ);
++                if (tickets.prefetchRemaining(chunk, now) > refreshBelow || this.inFlight.contains(chunk)) {
++                    continue;
++                }
++                if (world.chunkSource.getChunkAtIfLoadedMainThreadNoCache(chunkX, chunkZ) != null) {
++                    continue; // already generated
++                }
++                if (count >= MAX_CANDIDATES) {
++                    break;
++                }
++                if (count == this.sortBuffer.length) {
++                    this.sortBuffer = Arrays.copyOf(this.sortBuffer, count * 2);
++                }
++                this.candidates.add(chunk);
++                this.sortBuffer[count] = ((long)distanceSquared << 24) | count;
++                count++;
++            }
++        }
++        Arrays.sort(this.sortBuffer, 0, count);
++    }
++
++    private static int sortedIndex(final long packed) {
++        return (int)(packed & 0xFFFFFFL);
++    }
++
++    /**
++     * Adds prefetch tickets for the chunks, lets the chunk system start the generation and lowers its priority. The
++     * caller applies the limits.
++     */
++    public static void requestChunks(final ServerLevel world, final long[] chunks, final int count, final int ticketTicks) {
++        if (count <= 0 || ticketTicks <= 0) {
++            return;
++        }
++        final KodamaChunkTickets tickets = world.playerChunkLoader.kodamaTickets;
++        final ChunkHolderManager holderManager = world.chunkTaskScheduler.chunkHolderManager;
++        final long now = MinecraftServer.currentTickLong;
++
++        // the ticket manager reads the lifespan when it creates the ticket
++        KodamaChunkTickets.PREFETCH.timeout = ticketTicks;
++        for (int i = 0; i < count; i++) {
++            final long chunk = chunks[i];
++            tickets.trackPrefetch(chunk, now, ticketTicks);
++            holderManager.addTicketAtLevel(KodamaChunkTickets.PREFETCH, chunk, RegionizedPlayerChunkLoader.GENERATED_TICKET_LEVEL, Long.valueOf(chunk));
++        }
++        // the generation starts when the level change is propagated; this may call plugin logic, so do it last
++        holderManager.processTicketUpdates();
++        for (int i = 0; i < count; i++) {
++            final long chunk = chunks[i];
++            world.chunkTaskScheduler.kodamaSetChunkPriority(
++                CoordinateUtils.getChunkX(chunk), CoordinateUtils.getChunkZ(chunk), PrioritisedExecutor.Priority.LOW
++            );
++        }
++    }
++
++    /**
++     * Runs the prefetch of a player, falling back to doing nothing when the feature fails.
++     */
++    public void tickGuarded(final ServerLevel world, final ServerPlayer player, final PlayerMotion motion, final int centerX, final int centerZ,
++                            final int loadRadius, final boolean canGenerate, final int ownWork) {
++        try {
++            this.tick(world, player, motion, centerX, centerZ, loadRadius, canGenerate, ownWork);
++        } catch (final Throwable throwable) {
++            this.inFlight.clear();
++            FeatureGuard.reportFailure(ChunkLoadingSettings.PREFETCH, throwable);
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/DirectionalChunkOrder.java b/src/main/java/dev/kodama/chunk/DirectionalChunkOrder.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c48c5e0a4e4557f357724963126cb4896c5a7ac5
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/DirectionalChunkOrder.java
+@@ -0,0 +1,112 @@
++package dev.kodama.chunk;
++
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.util.CoordinateUtils;
++import it.unimi.dsi.fastutil.longs.LongComparator;
++
++/**
++ * Chunk order of the player chunk loader queues. Falls back to the vanilla (manhattan distance) comparator unless the
++ * directional priority was active when {@link #snapshot} was called.
++ * <p>
++ * The queues are heaps, so nothing this comparator reads may change while chunks are queued: the center, heading, speed
++ * weight and the active flag are only replaced in {@link #snapshot}, which the loader calls while all queues are empty.
++ * A change of the live configuration or of the player's direction is therefore applied by rebuilding the queues, see
++ * {@link #needsRebuild}.
++ */
++public final class DirectionalChunkOrder implements LongComparator {
++
++    /**
++     * Minimum number of ticks between two direction triggered rebuilds, a rebuild costs a pass over the whole view area.
++     */
++    private static final int MIN_REBUILD_INTERVAL_TICKS = 10;
++
++    private final LongComparator vanilla;
++
++    private boolean active;
++    private int centerX;
++    private int centerZ;
++    private double headingX;
++    private double headingZ;
++    private double weight;
++    private int snapshotDirectionKey;
++    private long snapshotTick;
++
++    public DirectionalChunkOrder(final LongComparator vanilla) {
++        this.vanilla = vanilla;
++    }
++
++    @Override
++    public int compare(final long c1, final long c2) {
++        if (!this.active) {
++            return this.vanilla.compare(c1, c2);
++        }
++        final int dx1 = CoordinateUtils.getChunkX(c1) - this.centerX;
++        final int dz1 = CoordinateUtils.getChunkZ(c1) - this.centerZ;
++        final int dx2 = CoordinateUtils.getChunkX(c2) - this.centerX;
++        final int dz2 = CoordinateUtils.getChunkZ(c2) - this.centerZ;
++
++        final int manhattan1 = Math.abs(dx1) + Math.abs(dz1);
++        final int manhattan2 = Math.abs(dx2) + Math.abs(dz2);
++
++        int result = Double.compare(this.score(dx1, dz1, manhattan1), this.score(dx2, dz2, manhattan2));
++        if (result != 0) {
++            return result;
++        }
++        result = Integer.compare(manhattan1, manhattan2);
++        if (result != 0) {
++            return result;
++        }
++        return Long.compare(c1, c2); // total order
++    }
++
++    private double score(final int dx, final int dz, final int manhattan) {
++        if (manhattan == 0) {
++            return 0.0;
++        }
++        final double cos = (dx * this.headingX + dz * this.headingZ) / Math.sqrt((double)dx * dx + (double)dz * dz);
++        return manhattan * (1.0 + this.weight * (1.0 - cos));
++    }
++
++    /**
++     * Whether the loader has to rebuild its queues because this order would now be different: the feature was switched
++     * on or off, or the player changed speed tier or heading sector while staying in the same chunk.
++     */
++    public boolean needsRebuild(final PlayerMotion motion) {
++        try {
++            final boolean wanted = ChunkLoadingSettings.priorityEnabled();
++            if (wanted != this.active) {
++                return true;
++            }
++            return wanted && motion.directionKey() != this.snapshotDirectionKey
++                && motion.ticks() - this.snapshotTick >= MIN_REBUILD_INTERVAL_TICKS;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(ChunkLoadingSettings.PRIORITY, throwable);
++            return false;
++        }
++    }
++
++    /**
++     * Takes the inputs of the order. Only call this while every queue that uses it is empty.
++     */
++    public void snapshot(final int centerX, final int centerZ, final PlayerMotion motion) {
++        this.centerX = centerX;
++        this.centerZ = centerZ;
++        try {
++            this.active = ChunkLoadingSettings.priorityEnabled();
++            if (this.active) {
++                this.headingX = motion.headingX();
++                this.headingZ = motion.headingZ();
++                this.weight = Math.min(Math.max(motion.speed() / 1.0, 0.0), 1.0) * ChunkLoadingSettings.directionWeight();
++                this.snapshotDirectionKey = motion.directionKey();
++                this.snapshotTick = motion.ticks();
++            }
++        } catch (final Throwable throwable) {
++            this.active = false; // vanilla order
++            FeatureGuard.reportFailure(ChunkLoadingSettings.PRIORITY, throwable);
++        }
++    }
++
++    public boolean isActive() {
++        return this.active;
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java b/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ad32f1ce5ecddff2f03887ba25b5431941156f5
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java
+@@ -0,0 +1,111 @@
++package dev.kodama.chunk;
++
++import ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor;
++import io.papermc.paper.util.CoordinateUtils;
++import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.TicketType;
++
++/**
++ * The Kodama chunk tickets of one world and the bookkeeping that bounds them. The chunk system expires the tickets
++ * itself (the ticket types have a lifespan); the maps here mirror the expiry tick so that Kodama can count the live
++ * tickets without asking the chunk system. Main thread only.
++ */
++public final class KodamaChunkTickets {
++
++    /**
++     * Keeps a chunk that left a player's view range loaded (full, not ticking) for a while. The lifespan is set from the
++     * configuration whenever a ticket is created.
++     */
++    public static final TicketType<Long> UNLOAD_DELAY = TicketType.create("kodama_unload_delay", Long::compareTo, 600);
++
++    /**
++     * Generates a chunk ahead of a moving player (full, not ticking). The lifespan is set from the configuration
++     * whenever a ticket is created.
++     */
++    public static final TicketType<Long> PREFETCH = TicketType.create("kodama_prefetch", Long::compareTo, 400);
++
++    private static final int SWEEP_INTERVAL_TICKS = 20;
++
++    private final Long2LongOpenHashMap unloadDelayExpiry = new Long2LongOpenHashMap(); // chunk key -> expiry tick
++    private final Long2LongOpenHashMap prefetchExpiry = new Long2LongOpenHashMap();
++    private long lastSweep;
++
++    public KodamaChunkTickets() {
++        this.unloadDelayExpiry.defaultReturnValue(Long.MIN_VALUE);
++        this.prefetchExpiry.defaultReturnValue(Long.MIN_VALUE);
++    }
++
++    /**
++     * Called once per tick of the world; drops the entries whose tickets have expired.
++     */
++    public void tick(final long now) {
++        if (now - this.lastSweep < SWEEP_INTERVAL_TICKS) {
++            return;
++        }
++        this.lastSweep = now;
++        if (!this.unloadDelayExpiry.isEmpty()) {
++            sweep(this.unloadDelayExpiry, now);
++        }
++        if (!this.prefetchExpiry.isEmpty()) {
++            sweep(this.prefetchExpiry, now);
++        }
++    }
++
++    private static void sweep(final Long2LongOpenHashMap map, final long now) {
++        map.long2LongEntrySet().removeIf(entry -> entry.getLongValue() <= now);
++    }
++
++    public int unloadDelayCount() {
++        return this.unloadDelayExpiry.size();
++    }
++
++    public int prefetchCount() {
++        return this.prefetchExpiry.size();
++    }
++
++    /**
++     * Records an unload delay ticket, unless this world already tracks {@code maxChunks}.
++     *
++     * @return whether the ticket may be added
++     */
++    boolean trackUnloadDelay(final long chunk, final long now, final long lifespanTicks, final int maxChunks) {
++        if (this.unloadDelayExpiry.size() >= maxChunks && !this.unloadDelayExpiry.containsKey(chunk)) {
++            sweep(this.unloadDelayExpiry, now);
++            if (this.unloadDelayExpiry.size() >= maxChunks) {
++                return false;
++            }
++        }
++        this.unloadDelayExpiry.put(chunk, now + lifespanTicks);
++        return true;
++    }
++
++    void trackPrefetch(final long chunk, final long now, final long lifespanTicks) {
++        this.prefetchExpiry.put(chunk, now + lifespanTicks);
++    }
++
++    /**
++     * Ticks until the prefetch ticket of the chunk expires, or 0 if there is none.
++     */
++    long prefetchRemaining(final long chunk, final long now) {
++        final long expiry = this.prefetchExpiry.get(chunk);
++        return expiry == Long.MIN_VALUE ? 0L : Math.max(0L, expiry - now);
++    }
++
++    public boolean isPrefetched(final long chunk) {
++        return !this.prefetchExpiry.isEmpty() && this.prefetchExpiry.containsKey(chunk);
++    }
++
++    /**
++     * A player's own chunk loading now needs a chunk that was prefetched with low priority: make the generation normal
++     * priority again so that the player is not held back by the prefetch.
++     */
++    public void raisePrefetchedPriority(final ServerLevel world, final long chunk) {
++        if (this.prefetchExpiry.isEmpty() || !this.prefetchExpiry.containsKey(chunk)) {
++            return;
++        }
++        world.chunkTaskScheduler.kodamaSetChunkPriority(
++            CoordinateUtils.getChunkX(chunk), CoordinateUtils.getChunkZ(chunk), PrioritisedExecutor.Priority.NORMAL
++        );
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/PearlPrefetch.java b/src/main/java/dev/kodama/chunk/PearlPrefetch.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..06c8155b5b033540523baab6768b8225684ff96c
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/PearlPrefetch.java
+@@ -0,0 +1,96 @@
++package dev.kodama.chunk;
++
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.util.CoordinateUtils;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.projectile.ThrownEnderpearl;
++import net.minecraft.world.level.chunk.LevelChunk;
++import net.minecraft.world.level.levelgen.Heightmap;
++import net.minecraft.world.phys.Vec3;
++
++/**
++ * Prefetches the chunks around the landing spot of a thrown ender pearl, so the teleport does not wait for the terrain.
++ */
++public final class PearlPrefetch {
++
++    private static final double GRAVITY = 0.03;
++    private static final double DRAG = 0.99;
++    private static final int MAX_STEPS = 200;
++
++    private PearlPrefetch() {
++    }
++
++    /**
++     * Called from the pearl's tick; acts once, on the first tick of the pearl.
++     */
++    public static void onTick(final ThrownEnderpearl pearl) {
++        if (pearl.tickCount != 0 || !(pearl.level() instanceof ServerLevel world) || !(pearl.getOwner() instanceof ServerPlayer owner)) {
++            return;
++        }
++        if (!ChunkLoadingSettings.pearlPrefetchEnabled() || !ChunkPrefetcher.canGenerateChunks(world, owner)) {
++            return;
++        }
++        try {
++            predictAndPrefetch(world, pearl);
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(ChunkLoadingSettings.PREFETCH, throwable);
++        }
++    }
++
++    private static void predictAndPrefetch(final ServerLevel world, final ThrownEnderpearl pearl) {
++        double x = pearl.getX();
++        double y = pearl.getY();
++        double z = pearl.getZ();
++        final Vec3 motion = pearl.getDeltaMovement();
++        double velocityX = motion.x;
++        double velocityY = motion.y;
++        double velocityZ = motion.z;
++
++        for (int step = 0; step < MAX_STEPS; step++) {
++            x += velocityX;
++            y += velocityY;
++            z += velocityZ;
++            velocityX *= DRAG;
++            velocityY = velocityY * DRAG - GRAVITY;
++            velocityZ *= DRAG;
++
++            if (y < world.getMinBuildHeight()) {
++                break;
++            }
++            final int blockX = (int)Math.floor(x);
++            final int blockZ = (int)Math.floor(z);
++            final LevelChunk chunk = world.chunkSource.getChunkAtIfLoadedMainThreadNoCache(blockX >> 4, blockZ >> 4);
++            if (chunk == null) {
++                break; // beyond the loaded terrain: this is as far as the prediction can see
++            }
++            if (y < chunk.getHeight(Heightmap.Types.MOTION_BLOCKING, blockX & 15, blockZ & 15)) {
++                break;
++            }
++        }
++
++        final int landingX = (int)Math.floor(x) >> 4;
++        final int landingZ = (int)Math.floor(z) >> 4;
++        final long[] chunks = new long[9];
++        int count = 0;
++        final KodamaChunkTickets tickets = world.playerChunkLoader.kodamaTickets;
++        final long now = net.minecraft.server.MinecraftServer.currentTickLong;
++        final int ticketTicks = ChunkLoadingSettings.prefetchTicketTicks();
++        for (int dz = -1; dz <= 1; dz++) {
++            for (int dx = -1; dx <= 1; dx++) {
++                final int chunkX = landingX + dx;
++                final int chunkZ = landingZ + dz;
++                if (!world.getWorldBorder().isChunkInBounds(chunkX, chunkZ)
++                    || world.chunkSource.getChunkAtIfLoadedMainThreadNoCache(chunkX, chunkZ) != null) {
++                    continue;
++                }
++                final long chunk = CoordinateUtils.getChunkKey(chunkX, chunkZ);
++                if (tickets.prefetchRemaining(chunk, now) > ticketTicks / 2) {
++                    continue;
++                }
++                chunks[count++] = chunk;
++            }
++        }
++        ChunkPrefetcher.requestChunks(world, chunks, count, ticketTicks);
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/PlayerMotion.java b/src/main/java/dev/kodama/chunk/PlayerMotion.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..771c010459a36d072915d0d98f6940e1174c18e0
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/PlayerMotion.java
+@@ -0,0 +1,354 @@
++package dev.kodama.chunk;
++
++import io.papermc.paper.util.CoordinateUtils;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import net.minecraft.server.level.ServerPlayer;
++
++/**
++ * Tracks how one player moves: smoothed velocity, heading and a five minute sliding window of statistics. Updated once
++ * per tick on the main thread from the player chunk loader; the getters are read-only and meant for the chunk
++ * features and for {@code /kodama status}.
++ * <p>
++ * Everything is stored in primitive fields and ring buffers, a tick does not allocate.
++ */
++public final class PlayerMotion {
++
++    public static final int TIER_STILL = 0;
++    public static final int TIER_WALK = 1;
++    public static final int TIER_FAST = 2;
++
++    public static final int HEADING_SECTORS = 16;
++
++    private static final int BUCKET_TICKS = 200; // 10 s
++    private static final int BUCKETS = 30; // 5 min
++    private static final double EMA_ALPHA = 0.3;
++    private static final double TELEPORT_DISTANCE_SQUARED = 64.0 * 64.0;
++    private static final double HEADING_SPEED = 0.1; // below this the look direction is the heading
++    private static final int MAX_VISITED_CHUNKS = 50_000;
++
++    // tier thresholds in blocks/tick, with hysteresis so that the tier does not flap around a boundary
++    private static final double STILL_ENTER = 0.08;
++    private static final double STILL_LEAVE = 0.10;
++    private static final double FAST_ENTER = 0.55;
++    private static final double FAST_LEAVE = 0.45;
++
++    // a sector change needs the heading to be this far (in sectors) from the current sector center
++    private static final double SECTOR_HYSTERESIS = 0.75;
++
++    private boolean hasLastPosition;
++    private double lastX;
++    private double lastZ;
++
++    private double velocityX;
++    private double velocityZ;
++    private double speed;
++    private double headingX;
++    private double headingZ = 1.0;
++    private boolean gliding;
++    private boolean passenger;
++
++    private int tier = TIER_STILL;
++    private int sector = -1;
++
++    private boolean hasLastChunk;
++    private int lastChunkX;
++    private int lastChunkZ;
++    private final LongOpenHashSet visitedChunks = new LongOpenHashSet();
++
++    private long ticks;
++
++    // ring buffer of the last five minutes, one entry per 10 seconds
++    private int currentBucket;
++    private int ticksInBucket;
++    private final int[] bucketTicks = new int[BUCKETS];
++    private final int[] bucketNewChunks = new int[BUCKETS];
++    private final int[] bucketGlideTicks = new int[BUCKETS];
++    private final int[] bucketVehicleTicks = new int[BUCKETS];
++    private final double[] bucketSpeedSum = new double[BUCKETS];
++    private final double[] bucketMinX = new double[BUCKETS];
++    private final double[] bucketMaxX = new double[BUCKETS];
++    private final double[] bucketMinZ = new double[BUCKETS];
++    private final double[] bucketMaxZ = new double[BUCKETS];
++
++    public PlayerMotion() {
++        this.resetBucket(0);
++    }
++
++    private void resetBucket(final int index) {
++        this.bucketTicks[index] = 0;
++        this.bucketNewChunks[index] = 0;
++        this.bucketGlideTicks[index] = 0;
++        this.bucketVehicleTicks[index] = 0;
++        this.bucketSpeedSum[index] = 0.0;
++        this.bucketMinX[index] = Double.POSITIVE_INFINITY;
++        this.bucketMaxX[index] = Double.NEGATIVE_INFINITY;
++        this.bucketMinZ[index] = Double.POSITIVE_INFINITY;
++        this.bucketMaxZ[index] = Double.NEGATIVE_INFINITY;
++    }
++
++    /**
++     * Main thread, once per tick.
++     */
++    public void update(final ServerPlayer player) {
++        this.ticks++;
++        final double x = player.getX();
++        final double z = player.getZ();
++        this.gliding = player.isFallFlying();
++        this.passenger = player.isPassenger();
++
++        double tickSpeed = 0.0;
++        if (this.hasLastPosition) {
++            final double dx = x - this.lastX;
++            final double dz = z - this.lastZ;
++            final double distanceSquared = dx * dx + dz * dz;
++            if (distanceSquared > TELEPORT_DISTANCE_SQUARED) {
++                this.velocityX = 0.0;
++                this.velocityZ = 0.0;
++                this.speed = 0.0;
++                this.hasLastChunk = false;
++            } else {
++                tickSpeed = Math.sqrt(distanceSquared);
++                this.velocityX += (dx - this.velocityX) * EMA_ALPHA;
++                this.velocityZ += (dz - this.velocityZ) * EMA_ALPHA;
++                this.speed = Math.sqrt(this.velocityX * this.velocityX + this.velocityZ * this.velocityZ);
++            }
++        }
++        this.hasLastPosition = true;
++        this.lastX = x;
++        this.lastZ = z;
++
++        if (this.speed > HEADING_SPEED) {
++            this.headingX = this.velocityX / this.speed;
++            this.headingZ = this.velocityZ / this.speed;
++        } else {
++            final double yaw = Math.toRadians(player.getYRot());
++            this.headingX = -Math.sin(yaw);
++            this.headingZ = Math.cos(yaw);
++        }
++
++        this.updateTier();
++        this.updateSector();
++
++        if (this.ticksInBucket >= BUCKET_TICKS) {
++            this.currentBucket = (this.currentBucket + 1) % BUCKETS;
++            this.ticksInBucket = 0;
++            this.resetBucket(this.currentBucket);
++        }
++        this.ticksInBucket++;
++        final int bucket = this.currentBucket;
++        this.bucketTicks[bucket]++;
++        this.bucketSpeedSum[bucket] += tickSpeed;
++        if (this.gliding) {
++            this.bucketGlideTicks[bucket]++;
++        }
++        if (this.passenger) {
++            this.bucketVehicleTicks[bucket]++;
++        }
++        if (x < this.bucketMinX[bucket]) {
++            this.bucketMinX[bucket] = x;
++        }
++        if (x > this.bucketMaxX[bucket]) {
++            this.bucketMaxX[bucket] = x;
++        }
++        if (z < this.bucketMinZ[bucket]) {
++            this.bucketMinZ[bucket] = z;
++        }
++        if (z > this.bucketMaxZ[bucket]) {
++            this.bucketMaxZ[bucket] = z;
++        }
++
++        final int chunkX = Math.floorDiv((int)Math.floor(x), 16);
++        final int chunkZ = Math.floorDiv((int)Math.floor(z), 16);
++        if (!this.hasLastChunk || chunkX != this.lastChunkX || chunkZ != this.lastChunkZ) {
++            this.hasLastChunk = true;
++            this.lastChunkX = chunkX;
++            this.lastChunkZ = chunkZ;
++            if (this.visitedChunks.size() >= MAX_VISITED_CHUNKS) {
++                this.visitedChunks.clear(); // bounded memory: forget the oldest history instead of growing
++            }
++            if (this.visitedChunks.add(CoordinateUtils.getChunkKey(chunkX, chunkZ))) {
++                this.bucketNewChunks[bucket]++;
++            }
++        }
++    }
++
++    private void updateTier() {
++        final double s = this.speed;
++        switch (this.tier) {
++            case TIER_STILL -> {
++                if (s >= STILL_LEAVE) {
++                    this.tier = s >= FAST_ENTER ? TIER_FAST : TIER_WALK;
++                }
++            }
++            case TIER_WALK -> {
++                if (s < STILL_ENTER) {
++                    this.tier = TIER_STILL;
++                } else if (s >= FAST_ENTER) {
++                    this.tier = TIER_FAST;
++                }
++            }
++            default -> {
++                if (s < FAST_LEAVE) {
++                    this.tier = s < STILL_ENTER ? TIER_STILL : TIER_WALK;
++                }
++            }
++        }
++    }
++
++    private void updateSector() {
++        if (this.tier == TIER_STILL) {
++            return; // the heading does not matter while standing, and the look direction would only cause noise
++        }
++        final double sectorWidth = 2.0 * Math.PI / HEADING_SECTORS;
++        double position = Math.atan2(this.headingZ, this.headingX) / sectorWidth; // in sectors, may be negative
++        if (position < 0.0) {
++            position += HEADING_SECTORS;
++        }
++        final int nearest = (int)Math.floor(position + 0.5) % HEADING_SECTORS;
++        if (this.sector < 0) {
++            this.sector = nearest;
++            return;
++        }
++        double offset = Math.abs(position - this.sector);
++        offset = Math.min(offset, HEADING_SECTORS - offset);
++        if (offset > SECTOR_HYSTERESIS) {
++            this.sector = nearest;
++        }
++    }
++
++    /**
++     * Identifies the (speed tier, heading sector) the chunk queues were ordered for; a change of the key is a reason to
++     * order them again. While standing still only the tier counts.
++     */
++    public int directionKey() {
++        return this.tier == TIER_STILL ? 0 : (this.tier << 8) | (this.sector + 1);
++    }
++
++    /**
++     * Total ticks this tracker was updated.
++     */
++    public long ticks() {
++        return this.ticks;
++    }
++
++    /**
++     * Smoothed horizontal speed in blocks per tick.
++     */
++    public double speed() {
++        return this.speed;
++    }
++
++    public double speedBlocksPerSecond() {
++        return this.speed * 20.0;
++    }
++
++    public double velocityX() {
++        return this.velocityX;
++    }
++
++    public double velocityZ() {
++        return this.velocityZ;
++    }
++
++    /**
++     * Unit vector x component of the heading: the velocity direction when moving, else the look direction.
++     */
++    public double headingX() {
++        return this.headingX;
++    }
++
++    public double headingZ() {
++        return this.headingZ;
++    }
++
++    /**
++     * {@link #TIER_STILL}, {@link #TIER_WALK} or {@link #TIER_FAST}.
++     */
++    public int tier() {
++        return this.tier;
++    }
++
++    public boolean isGliding() {
++        return this.gliding;
++    }
++
++    public boolean isPassenger() {
++        return this.passenger;
++    }
++
++    private int windowTicks() {
++        int total = 0;
++        for (int i = 0; i < BUCKETS; i++) {
++            total += this.bucketTicks[i];
++        }
++        return total;
++    }
++
++    /**
++     * Chunk positions entered for the first time in this session, per minute, over the last five minutes (or the time
++     * since the player joined, but at least ten seconds).
++     */
++    public double newChunksPerMinute() {
++        int chunks = 0;
++        for (int i = 0; i < BUCKETS; i++) {
++            chunks += this.bucketNewChunks[i];
++        }
++        return chunks * 1200.0 / Math.max(BUCKET_TICKS, this.windowTicks());
++    }
++
++    /**
++     * Average horizontal speed in blocks per tick over the window, teleports excluded.
++     */
++    public double averageSpeed() {
++        double sum = 0.0;
++        for (int i = 0; i < BUCKETS; i++) {
++            sum += this.bucketSpeedSum[i];
++        }
++        final int total = this.windowTicks();
++        return total == 0 ? 0.0 : sum / total;
++    }
++
++    /**
++     * Share of the window spent gliding with an elytra, 0 to 1.
++     */
++    public double elytraFraction() {
++        int sum = 0;
++        for (int i = 0; i < BUCKETS; i++) {
++            sum += this.bucketGlideTicks[i];
++        }
++        final int total = this.windowTicks();
++        return total == 0 ? 0.0 : (double)sum / total;
++    }
++
++    /**
++     * Share of the window spent riding a vehicle or mount, 0 to 1.
++     */
++    public double vehicleFraction() {
++        int sum = 0;
++        for (int i = 0; i < BUCKETS; i++) {
++            sum += this.bucketVehicleTicks[i];
++        }
++        final int total = this.windowTicks();
++        return total == 0 ? 0.0 : (double)sum / total;
++    }
++
++    /**
++     * Larger side, in blocks, of the bounding box of all positions in the window.
++     */
++    public double boundingRange() {
++        double minX = Double.POSITIVE_INFINITY;
++        double maxX = Double.NEGATIVE_INFINITY;
++        double minZ = Double.POSITIVE_INFINITY;
++        double maxZ = Double.NEGATIVE_INFINITY;
++        for (int i = 0; i < BUCKETS; i++) {
++            if (this.bucketTicks[i] == 0) {
++                continue;
++            }
++            minX = Math.min(minX, this.bucketMinX[i]);
++            maxX = Math.max(maxX, this.bucketMaxX[i]);
++            minZ = Math.min(minZ, this.bucketMinZ[i]);
++            maxZ = Math.max(maxZ, this.bucketMaxZ[i]);
++        }
++        return maxX < minX ? 0.0 : Math.max(maxX - minX, maxZ - minZ);
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/UnloadDelay.java b/src/main/java/dev/kodama/chunk/UnloadDelay.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..22e9513abfa91cddc18f60363ef984fa2f887668
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/UnloadDelay.java
+@@ -0,0 +1,47 @@
++package dev.kodama.chunk;
++
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader;
++import io.papermc.paper.chunk.system.scheduling.ChunkHolderManager;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Keeps a chunk that just left the load range of a player in memory for a while, so that turning around does not have
++ * to load it again. The chunk is held at the "full, not ticking" ticket level; the client still gets its unload packet.
++ */
++public final class UnloadDelay {
++
++    private UnloadDelay() {
++    }
++
++    /**
++     * Creates the ticket operation for a chunk that left the load range of a player, or {@code null} if the chunk should
++     * unload as usual.
++     *
++     * @param fullyGenerated whether the player had the chunk at least fully generated; a chunk that is only loaded or still
++     *                       generating is not worth holding (and the ticket would start generating it)
++     */
++    public static ChunkHolderManager.@Nullable TicketOperation<?, ?> createTicketOperation(final ServerLevel world, final long chunk,
++                                                                                        final boolean fullyGenerated) {
++        if (!fullyGenerated || !ChunkLoadingSettings.unloadDelayEnabled()) {
++            return null;
++        }
++        try {
++            final KodamaChunkTickets tickets = world.playerChunkLoader.kodamaTickets;
++            final int lifespan = ChunkLoadingSettings.unloadDelayTicks();
++            if (!tickets.trackUnloadDelay(chunk, MinecraftServer.currentTickLong, lifespan, ChunkLoadingSettings.unloadDelayMaxChunks())) {
++                return null;
++            }
++            // the ticket manager reads the lifespan when it creates the ticket; the value is the same for all worlds
++            KodamaChunkTickets.UNLOAD_DELAY.timeout = lifespan;
++            return ChunkHolderManager.TicketOperation.addOp(
++                chunk, KodamaChunkTickets.UNLOAD_DELAY, RegionizedPlayerChunkLoader.GENERATED_TICKET_LEVEL, Long.valueOf(chunk)
++            );
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(ChunkLoadingSettings.UNLOAD_DELAY, throwable);
++            return null;
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+index c0045dba78caee11724eaef9aa1ff7048189daeb..4e4b36d64db58bc376ca25f658cd29cd903a70d8 100644
+--- a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -47,6 +47,7 @@ public final class StatusCommand extends PermissionedKodamaSubcommand {
+                 }
+             });
+         }
++        dev.kodama.chunk.ChunkLoadingStatus.register();
+     }
+ 
+     public StatusCommand() {
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index e97481e0174fe1f48b444ff3b75d8ebc901a1a41..e3d66896b15cb051a6d95f67797e397ca82cb715 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -55,8 +55,63 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+     public ChunkLoading chunkLoading;
+ 
+     public class ChunkLoading extends ConfigurationPart {
+-        @Comment("Enables the chunk loading optimizations.")
++        @Comment("Enables the chunk loading optimizations. Master switch of every option below, including the player motion tracker.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++        @Comment("Loads the chunks in the direction the player is moving first.")
++        public Priority priority;
++
++        public class Priority extends ConfigurationPart {
++            @Comment("Orders the chunk loading queues of a player by distance and movement direction instead of distance alone.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("How strongly chunks behind the player are pushed back at full speed (1 block per tick or more).\n"
++                + "0 keeps the vanilla order; the effect scales down with slower movement.")
++            public PresetDouble directionWeight = PresetDouble.of(1.5, 1.5, 2.5);
++        }
++
++        @Comment("Keeps chunks that left the view range of a player loaded for a while, so turning around is instant.")
++        public UnloadDelay unloadDelay;
++
++        public class UnloadDelay extends ConfigurationPart {
++            @Comment("Enables delayed unloading of chunks behind the player.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("How long, in seconds, a chunk that left the view range stays loaded (not ticking). 0 disables the delay.")
++            public PresetInt unloadDelaySeconds = PresetInt.of(0, 30, 60);
++
++            @Comment("Maximum number of chunks per world kept alive by this feature at the same time. Extra chunks unload as usual.")
++            public PresetInt unloadDelayMaxChunks = PresetInt.of(0, 1024, 4096);
++        }
++
++        @Comment("Generates chunks ahead of fast moving players (elytra, vehicles) before the vanilla view range reaches them.")
++        public Prefetch prefetch;
++
++        public class Prefetch extends ConfigurationPart {
++            @Comment("Enables predictive chunk prefetching.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("Seconds of lookahead per block/second of player speed. Walking (4.3 b/s) looks about one second ahead.")
++            public PresetDouble prefetchSecondsPerSpeed = PresetDouble.of(0.0, 0.25, 0.4);
++
++            @Comment("Upper limit of the lookahead, in seconds.")
++            public PresetDouble prefetchMaxSeconds = PresetDouble.of(0.0, 8.0, 12.0);
++
++            @Comment("Half-angle, in degrees, of the fan in front of the player in which chunks are prefetched.")
++            public PresetInt prefetchAngle = PresetInt.of(0, 35, 45);
++
++            @Comment("How long, in seconds, a prefetched chunk is kept loaded (not ticking) while waiting for the player.")
++            public PresetInt prefetchTicketSeconds = PresetInt.of(0, 20, 30);
++
++            @Comment("Maximum number of prefetched chunks per player that are still being generated.")
++            public PresetInt prefetchMaxInflight = PresetInt.of(0, 16, 32);
++
++            @Comment("Maximum number of chunks the server starts to prefetch per tick, over all players.")
++            public PresetInt prefetchMaxPerTick = PresetInt.of(0, 8, 16);
++        }
++
++        @Comment("Prefetches the 3x3 chunks around the predicted landing spot of thrown ender pearls. Needs prefetch.enabled.")
++        public PresetBoolean prefetchPearls = PresetBoolean.of(false, true, true);
+     }
+ 
+     @Comment("Network and packet optimizations.")
+diff --git a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+index 149cfb0587299f72fcfddf395fb71b70438986c1..ba6693336469d8a19eedf3826f0584e99021c41e 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
++++ b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+@@ -197,6 +197,7 @@ public class RegionizedPlayerChunkLoader {
+     }
+ 
+     private final ServerLevel world;
++    public final dev.kodama.chunk.KodamaChunkTickets kodamaTickets = new dev.kodama.chunk.KodamaChunkTickets(); // Kodama - chunk-prefetch, chunk-unload-delay
+ 
+     public RegionizedPlayerChunkLoader(final ServerLevel world) {
+         this.world = world;
+@@ -313,14 +314,17 @@ public class RegionizedPlayerChunkLoader {
+     public void tick() {
+         TickThread.ensureTickThread("Cannot tick player chunk loader async");
+         long currTime = System.nanoTime();
++        this.kodamaTickets.tick(net.minecraft.server.MinecraftServer.currentTickLong); // Kodama - chunk-prefetch, chunk-unload-delay
+         for (final ServerPlayer player : new java.util.ArrayList<>(this.world.players())) {
+             final PlayerChunkLoaderData loader = player.chunkLoader;
+             if (loader == null || loader.world != this.world) {
+                 // not our problem anymore
+                 continue;
+             }
++            loader.kodamaUpdateMotion(); // Kodama - chunk-priority
+             loader.update(); // can't invoke plugin logic
+             loader.updateQueues(currTime);
++            loader.kodamaTickPrefetch(); // Kodama - chunk-prefetch
+         }
+     }
+ 
+@@ -378,7 +382,11 @@ public class RegionizedPlayerChunkLoader {
+         private final AllocatingRateLimiter chunkGenerateTicketLimiter = new AllocatingRateLimiter();
+ 
+         // queues
+-        private final LongComparator CLOSEST_MANHATTAN_DIST = (final long c1, final long c2) -> {
++        // Kodama start - chunk-priority
++        private final dev.kodama.chunk.PlayerMotion kodamaMotion = new dev.kodama.chunk.PlayerMotion();
++        private final dev.kodama.chunk.ChunkPrefetcher kodamaPrefetch = new dev.kodama.chunk.ChunkPrefetcher();
++        // Kodama end - chunk-priority
++        private final LongComparator CLOSEST_MANHATTAN_DIST_VANILLA = (final long c1, final long c2) -> { // Kodama - chunk-priority
+             final int c1x = CoordinateUtils.getChunkX(c1);
+             final int c1z = CoordinateUtils.getChunkZ(c1);
+ 
+@@ -393,6 +401,7 @@ public class RegionizedPlayerChunkLoader {
+                 Math.abs(c2x - centerX) + Math.abs(c2z - centerZ)
+             );
+         };
++        private final dev.kodama.chunk.DirectionalChunkOrder CLOSEST_MANHATTAN_DIST = new dev.kodama.chunk.DirectionalChunkOrder(CLOSEST_MANHATTAN_DIST_VANILLA); // Kodama - chunk-priority
+         private final LongHeapPriorityQueue sendQueue = new LongHeapPriorityQueue(CLOSEST_MANHATTAN_DIST);
+         private final LongHeapPriorityQueue tickingQueue = new LongHeapPriorityQueue(CLOSEST_MANHATTAN_DIST);
+         private final LongHeapPriorityQueue generatingQueue = new LongHeapPriorityQueue(CLOSEST_MANHATTAN_DIST);
+@@ -469,6 +478,16 @@ public class RegionizedPlayerChunkLoader {
+                     TicketType.UNKNOWN, level, new ChunkPos(chunkX, chunkZ),
+                     REGION_PLAYER_TICKET, level, parameter.idBoxed
+                 ));
++                // Kodama start - chunk-unload-delay
++                if (!parameter.removed) { // a leaving player does not turn around
++                    final ChunkHolderManager.TicketOperation<?, ?> kodamaOp = dev.kodama.chunk.UnloadDelay.createTicketOperation(
++                        parameter.world, chunk, ticketStage >= CHUNK_TICKET_STAGE_GENERATED
++                    );
++                    if (kodamaOp != null) {
++                        parameter.pushDelayedTicketOp(kodamaOp);
++                    }
++                }
++                // Kodama end - chunk-unload-delay
+             }
+         };
+         private final SingleUserAreaMap<PlayerChunkLoaderData> tickMap = new SingleUserAreaMap<>(this) {
+@@ -754,6 +773,7 @@ public class RegionizedPlayerChunkLoader {
+                     )
+                 );
+                 this.generatingQueue.enqueue(chunkKey);
++                this.world.playerChunkLoader.kodamaTickets.raisePrefetchedPriority(this.world, chunkKey); // Kodama - chunk-prefetch
+             }
+ 
+             // try to pull ticking chunks
+@@ -908,6 +928,8 @@ public class RegionizedPlayerChunkLoader {
+ 
+                     // can we still generate chunks?
+                     && this.canGenerateChunks == canGenerateChunks
++
++                    && !this.CLOSEST_MANHATTAN_DIST.needsRebuild(this.kodamaMotion) // Kodama - chunk-priority
+             ) {
+                 // nothing we care about changed, so we're not re-calculating
+                 return;
+@@ -943,6 +965,10 @@ public class RegionizedPlayerChunkLoader {
+             this.lastLoadDistance = loadViewDistance;
+             this.lastTickDistance = tickViewDistance;
+             this.canGenerateChunks = canGenerateChunks;
++            // Kodama start - chunk-priority
++            // the queues are empty here, so the order may change
++            this.CLOSEST_MANHATTAN_DIST.snapshot(currentChunkX, currentChunkZ, this.kodamaMotion);
++            // Kodama end - chunk-priority
+ 
+             // +1 since we need to load chunks +1 around the load view distance...
+             final long[] toIterate = SEARCH_RADIUS_ITERATION_LIST[loadViewDistance + 1];
+@@ -1022,6 +1048,37 @@ public class RegionizedPlayerChunkLoader {
+             this.flushDelayedTicketOps();
+         }
+ 
++        // Kodama start - chunk-priority, chunk-prefetch
++        void kodamaUpdateMotion() {
++            if (!dev.kodama.chunk.ChunkLoadingSettings.masterEnabled()) {
++                return;
++            }
++            try {
++                this.kodamaMotion.update(this.player);
++            } catch (final Throwable throwable) {
++                dev.kodama.feature.FeatureGuard.reportFailure(dev.kodama.chunk.ChunkLoadingSettings.PRIORITY, throwable);
++            }
++        }
++
++        void kodamaTickPrefetch() {
++            if (this.removed || this.lastChunkX == Integer.MIN_VALUE) {
++                return;
++            }
++            this.kodamaPrefetch.tickGuarded(
++                this.world, this.player, this.kodamaMotion, this.lastChunkX, this.lastChunkZ, this.lastLoadDistance + 1, this.canGenerateChunks,
++                this.loadingQueue.size() + this.genQueue.size() + this.generatingQueue.size()
++            );
++        }
++
++        public dev.kodama.chunk.PlayerMotion kodamaMotion() {
++            return this.kodamaMotion;
++        }
++
++        public dev.kodama.chunk.ChunkPrefetcher kodamaPrefetcher() {
++            return this.kodamaPrefetch;
++        }
++        // Kodama end - chunk-priority, chunk-prefetch
++
+         void remove() {
+             TickThread.ensureTickThread(this.player, "Cannot add player asynchronously");
+             if (this.removed) {
+diff --git a/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java b/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java
+index 049e20407033073b06fcdeb46c38485f4926d778..00386dc05940b7a207636b08266ad3dc1687dd34 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java
++++ b/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java
+@@ -425,6 +425,20 @@ public final class ChunkTaskScheduler {
+         }
+     }
+ 
++    // Kodama start - chunk-prefetch
++    public void kodamaSetChunkPriority(final int chunkX, final int chunkZ, final PrioritisedExecutor.Priority priority) {
++        final ca.spottedleaf.concurrentutil.lock.ReentrantAreaLock.Node schedulingLock = this.schedulingLockArea.lock(chunkX, chunkZ);
++        try {
++            final NewChunkHolder chunkHolder = this.chunkHolderManager.getChunkHolder(chunkX, chunkZ);
++            if (chunkHolder != null) {
++                chunkHolder.setPriority(priority);
++            }
++        } finally {
++            this.schedulingLockArea.unlock(schedulingLock);
++        }
++    }
++    // Kodama end - chunk-prefetch
++
+     public void scheduleChunkLoad(final int chunkX, final int chunkZ, final boolean gen, final ChunkStatus toStatus, final boolean addTicket,
+                                   final PrioritisedExecutor.Priority priority, final Consumer<ChunkAccess> onComplete) {
+         if (gen) {
+diff --git a/src/main/java/net/minecraft/world/entity/projectile/ThrownEnderpearl.java b/src/main/java/net/minecraft/world/entity/projectile/ThrownEnderpearl.java
+index 519755b7f8bc7e8bb9fab135fc5bf7de3a9419f9..707bfa367ff2b393af4e1f7685b574f1683dc495 100644
+--- a/src/main/java/net/minecraft/world/entity/projectile/ThrownEnderpearl.java
++++ b/src/main/java/net/minecraft/world/entity/projectile/ThrownEnderpearl.java
+@@ -102,6 +102,7 @@ public class ThrownEnderpearl extends ThrowableItemProjectile {
+ 
+     @Override
+     public void tick() {
++        dev.kodama.chunk.PearlPrefetch.onTick(this); // Kodama - chunk-prefetch
+         Entity entity = this.getOwner();
+ 
+         if (entity instanceof ServerPlayer && !entity.isAlive() && this.level().getGameRules().getBoolean(GameRules.RULE_ENDER_PEARLS_VANISH_ON_DEATH)) {
