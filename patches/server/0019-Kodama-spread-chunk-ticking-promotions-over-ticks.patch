@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 18:23:24 +0900
+Subject: [PATCH] Kodama: spread chunk ticking promotions over ticks
+
+License: GPL-3.0
+
+A chunk that starts ticking runs its post-generation fluid updates on the
+main thread. With prefetched chunks many of them become ticking in the same
+tick and cause a lag spike. Limit the promotions per player per tick; sending
+chunks to the client does not wait for ticking.
+
+diff --git a/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java b/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java
+index bd47b7a17f214856fd1e98f1f9e49fabf45e1a63..814334bf464b11ed4ee5bb7988ef60e277058c3b 100644
+--- a/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java
++++ b/src/main/java/dev/kodama/chunk/ChunkLoadingSettings.java
+@@ -64,6 +64,15 @@ public final class ChunkLoadingSettings {
+         return section == null ? 0 : Math.max(0, section.unloadDelay.unloadDelayMaxChunks.getAsInt());
+     }
+ 
++    /**
++     * Ticking promotions per player per tick, 0 for no limit. A chunk that starts ticking runs its post-generation
++     * fluid updates, so many promotions in one tick are a lag spike; sending to the client does not wait for this.
++     */
++    public static int maxTickingPromotionsPerTick() {
++        final KodamaGlobalConfiguration.ChunkLoading section = section();
++        return section == null || !section.enabled.isTrue() ? 0 : Math.max(0, section.maxTickingPromotionsPerTick.getAsInt());
++    }
++
+     public static boolean prefetchEnabled() {
+         final KodamaGlobalConfiguration.ChunkLoading section = section();
+         return section != null && section.enabled.isTrue() && section.prefetch.enabled.isTrue() && !FeatureGuard.isTripped(PREFETCH);
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index b5d302024fe6983c00d6815adf3b6eacccd14a4f..2b762da5a1cc91ec4476018f1f2d6e7ad4c908fe 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -60,6 +60,11 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+         @Comment("Enables the chunk loading optimizations. Master switch of every option below, including the player motion tracker.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
+ 
++        @Comment("How many chunks per player may start ticking in one tick, 0 for no limit.\n"
++            + "A chunk that starts ticking runs its post-generation fluid updates, so many at once cause a lag spike.\n"
++            + "Chunks are still sent to the client without waiting for this.")
++        public PresetInt maxTickingPromotionsPerTick = PresetInt.of(0, 16, 8);
++
+         @Comment("Loads the chunks in the direction the player is moving first.")
+         public Priority priority;
+ 
+diff --git a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+index 3bfdfdbc9eceafbe0cd859709e26f0608a8a9b44..474c6a55ac92086892f04dc3464f589326bbcdc5 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
++++ b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+@@ -777,8 +777,11 @@ public class RegionizedPlayerChunkLoader {
+             }
+ 
+             // try to pull ticking chunks
++            final int kodamaMaxTickPromotions = dev.kodama.chunk.ChunkLoadingSettings.maxTickingPromotionsPerTick(); // Kodama - spread ticking promotions
++            int kodamaTickPromotions = 0; // Kodama - spread ticking promotions
+             tick_check_outer:
+             while (!this.tickingQueue.isEmpty()) {
++                if (kodamaMaxTickPromotions > 0 && kodamaTickPromotions >= kodamaMaxTickPromotions) break; // Kodama - spread ticking promotions
+                 final long pendingTicking = this.tickingQueue.firstLong();
+                 final int pendingChunkX = CoordinateUtils.getChunkX(pendingTicking);
+                 final int pendingChunkZ = CoordinateUtils.getChunkZ(pendingTicking);
+@@ -798,6 +801,7 @@ public class RegionizedPlayerChunkLoader {
+                 }
+                 // only gets here if all neighbours were marked as generated or ticking themselves
+                 this.tickingQueue.dequeueLong();
++                ++kodamaTickPromotions; // Kodama - spread ticking promotions
+                 this.pushDelayedTicketOp(
+                     ChunkHolderManager.TicketOperation.addAndRemove(
+                         pendingTicking,
