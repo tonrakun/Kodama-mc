@@ -1,0 +1,17 @@
+{
+  "name": "kodama-bench",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Paper vs Kodama benchmark runner and vanilla-parity driver",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "bench": "node src/cli.js bench",
+    "vanilla": "node src/cli.js vanilla"
+  },
+  "dependencies": {
+    "mineflayer": "^4.39.0"
+  }
+}

@@ -1,0 +1,67 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      bots:
+        description: Number of bots
+        default: '10'
+      duration:
+        description: Measured seconds
+        default: '120'
+      seeds:
+        description: Number of parity seeds
+        default: '2'
+      radius:
+        description: Parity generation radius (chunks)
+        default: '16'
+  schedule:
+    - cron: '0 18 * * 0'
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      BOTS: ${{ inputs.bots || '10' }}
+      DURATION: ${{ inputs.duration || '120' }}
+      SEEDS: ${{ inputs.seeds || '2' }}
+      RADIUS: ${{ inputs.radius || '16' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Configure Git user
+        run: git config --global user.email "actions@github.com" && git config --global user.name "GitHub Actions"
+      - name: Build server and harness jars
+        run: ./gradlew applyPatches createMojmapPaperclipJar :kodama-harness:jar
+      - name: Install bench dependencies
+        working-directory: testing/bench
+        run: npm ci
+      # The shared runner is noisy, so regressions are reported but never fail the job.
+      - name: Benchmark
+        working-directory: testing/bench
+        run: npm run bench -- --bots "$BOTS" --duration "$DURATION" --heap 4G --no-affinity
+      - name: Vanilla parity
+        if: ${{ !cancelled() }}
+        working-directory: testing/bench
+        run: npm run vanilla -- --seeds "$SEEDS" --radius "$RADIUS"
+      - name: Publish summary
+        if: always()
+        run: |
+          for f in testing/results/*/report.md testing/results/*/parity.md; do
+            [ -f "$f" ] && cat "$f" >> "$GITHUB_STEP_SUMMARY" && echo >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: testing/results
+          if-no-files-found: ignore

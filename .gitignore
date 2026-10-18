@@ -36,3 +36,9 @@ AGENTS.md
 .cursor/
 
 !gradle/wrapper/gradle-wrapper.jar
+
+# Benchmark / parity tooling
+testing/.cache/
+testing/.work/
+testing/results/
+testing/bench/node_modules/
