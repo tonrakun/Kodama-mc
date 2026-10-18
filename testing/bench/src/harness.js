@@ -47,7 +47,7 @@ export async function runPregen({ flavor, dir, seed, radius, worlds, env, label,
 export async function runMetrics({ flavor, dir, worldSrc, opts, env, serverCpus, botCpus, label }) {
   const jar = await resolveJar(flavor);
   const harness = await harnessJar();
-  prepareServerDir(dir, { ...commonServerOptions(flavor, dir, env, jar, harness), seed: opts.seed, worldSrc });
+  prepareServerDir(dir, { ...commonServerOptions(flavor, dir, env, jar, harness), seed: opts.seed, worldSrc, kodamaSettings: opts.kodamaSet });
   const out = join(dir, 'harness-out');
   mkdirSync(out, { recursive: true });
   const botsPath = join(out, 'bots.json');

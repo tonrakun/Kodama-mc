@@ -51,6 +51,10 @@ export function prepareServerDir(dir, o) {
     ].join('\n'),
   );
   writeFileSync(join(dir, 'spigot.yml'), 'settings:\n  moved-too-quickly-multiplier: 1000.0\n  moved-wrongly-threshold: 1000.0\n');
+  if (o.flavor === 'kodama' && o.kodamaSettings?.length) {
+    mkdirSync(join(dir, 'config'), { recursive: true });
+    writeFileSync(join(dir, 'config', 'kodama-global.yml'), toNestedYaml(o.kodamaSettings));
+  }
   if (o.deterministic) {
     // Features spill into neighbour chunks, so the result depends on generation order; one worker makes it fixed.
     mkdirSync(join(dir, 'config'), { recursive: true });
@@ -65,6 +69,32 @@ export function prepareServerDir(dir, o) {
     const src = join(o.worldSrc, world);
     if (existsSync(src)) copyWorld(src, join(dir, world));
   }
+}
+
+/** ['a.b=1', 'a.c=x'] -> nested YAML; Kodama fills in every key that is not given. */
+export function toNestedYaml(settings) {
+  const root = {};
+  for (const entry of settings) {
+    const eq = entry.indexOf('=');
+    if (eq < 1) throw new Error(`--kodama-set expects key=value, got '${entry}'`);
+    const path = entry.slice(0, eq).split('.');
+    let node = root;
+    for (const key of path.slice(0, -1)) node = node[key] ??= {};
+    node[path.at(-1)] = entry.slice(eq + 1);
+  }
+  const lines = [];
+  const walk = (node, indent) => {
+    for (const [k, v] of Object.entries(node)) {
+      if (typeof v === 'object') {
+        lines.push(`${indent}${k}:`);
+        walk(v, `${indent}  `);
+      } else {
+        lines.push(`${indent}${k}: ${v}`);
+      }
+    }
+  };
+  walk(root, '');
+  return `${lines.join('\n')}\n`;
 }
 
 export function copyWorld(src, dest) {

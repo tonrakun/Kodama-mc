@@ -24,6 +24,7 @@ bench options:
   --warmup <s>               (30)
   --seed <string>            World seed (kodama)
   --pregen-radius <chunks>   Radius of the cached pre-generated world (24)
+  --kodama-set key=value     Kodama global config override (repeatable), e.g. chunk-loading.prefetch.enabled=false
   --explorer-speed <b/s>     Explorer bot speed in blocks/s (30)
   --server-cpus <list>       Server CPU pinning (0-7)
   --bot-cpus <list>          Bot swarm CPU pinning (8-11)
@@ -57,6 +58,7 @@ const options = {
   warmup: { type: 'string', default: '30' },
   seed: { type: 'string', default: 'kodama' },
   'pregen-radius': { type: 'string', default: '24' },
+  'kodama-set': { type: 'string', multiple: true },
   'explorer-speed': { type: 'string', default: '30' },
   'server-cpus': { type: 'string', default: '0-7' },
   'bot-cpus': { type: 'string', default: '8-11' },
@@ -110,6 +112,7 @@ async function main() {
       warmup: number(values, 'warmup', { min: 0 }),
       seed: values.seed,
       pregenRadius: number(values, 'pregen-radius', { min: 1 }),
+      kodamaSet: values['kodama-set'] ?? [],
       explorerSpeed: number(values, 'explorer-speed', { min: 0, integer: false }),
       serverCpus: values['server-cpus'],
       botCpus: values['bot-cpus'],

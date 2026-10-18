@@ -10,6 +10,8 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.EntityRemoveEvent;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -66,6 +68,7 @@ final class MetricsRecorder implements Listener {
 
     private long deaths;
     private long dropItems;
+    private final Map<String, long[]> despawnsByType = new LinkedHashMap<>();
 
     private volatile boolean recording;
 
@@ -117,6 +120,16 @@ final class MetricsRecorder implements Listener {
                 Bukkit.shutdown();
             }
         }
+    }
+
+    // Paper marks this Bukkit event for removal, but on 1.20.6 it is the only event that tells despawns apart.
+    @SuppressWarnings("removal")
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onRemove(EntityRemoveEvent e) {
+        if (!recording || e.getCause() != EntityRemoveEvent.Cause.DESPAWN) {
+            return;
+        }
+        despawnsByType.computeIfAbsent(e.getEntityType().name(), k -> new long[1])[0]++;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -270,6 +283,26 @@ final class MetricsRecorder implements Listener {
             worlds.put(w.getName(), m);
         }
 
+        Map<String, Long> mobsByType = new java.util.TreeMap<>();
+        for (World w : Bukkit.getWorlds()) {
+            for (LivingEntity le : w.getLivingEntities()) {
+                if (!(le instanceof Player)) {
+                    mobsByType.merge(le.getType().name(), 1L, Long::sum);
+                }
+            }
+        }
+        Map<String, Long> despawns = new java.util.TreeMap<>();
+        long despawnTotal = 0;
+        for (Map.Entry<String, long[]> en : despawnsByType.entrySet()) {
+            despawns.put(en.getKey(), en.getValue()[0]);
+            despawnTotal += en.getValue()[0];
+        }
+        Map<String, Object> mobs = new LinkedHashMap<>();
+        mobs.put("total", mobsByType.values().stream().mapToLong(Long::longValue).sum());
+        mobs.put("byType", mobsByType);
+        mobs.put("despawns", despawnTotal);
+        mobs.put("despawnsByType", despawns);
+
         Map<String, Object> drops = new LinkedHashMap<>();
         drops.put("deaths", deaths);
         drops.put("items", dropItems);
@@ -290,6 +323,7 @@ final class MetricsRecorder implements Listener {
         out.put("worlds", worlds);
         out.put("players", Bukkit.getOnlinePlayers().size());
         out.put("drops", drops);
+        out.put("mobs", mobs);
         return out;
     }
 }

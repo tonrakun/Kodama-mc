@@ -28,6 +28,8 @@ export const ROWS = [
   { id: 'chunkLatency.p99', label: 'Chunk latency p99 (ms)', get: (_, b) => num(b?.chunkLatencyMs?.p99), digits: 0 },
   { id: 'chunksMissing', label: 'Chunks missing >5s', get: (_, b) => num(b?.chunksMissingOver5s), digits: 0 },
   { id: 'explorerSpeed', label: 'Explorer speed (blocks/s)', get: (_, b) => num(b?.explorerSpeedAvg), digits: 1 },
+  { id: 'mobs', label: 'Mobs (living, non-player)', get: (m) => num(m.mobs?.total), digits: 0 },
+  { id: 'despawns', label: 'Despawns', get: (m) => num(m.mobs?.despawns), digits: 0 },
   { id: 'entities', label: 'Entities', get: (m) => sumWorlds(m, 'entities'), digits: 0 },
 ];
 
