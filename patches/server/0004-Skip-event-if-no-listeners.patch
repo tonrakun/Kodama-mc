@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lilingfengdev <145678359+lilingfengdev@users.noreply.github.com>
+Date: Wed, 17 Jan 2024 18:16:38 +0800
+Subject: [PATCH] Skip event if no listeners
+
+Imported into Kodama from Leaf (https://github.com/Winds-Studio/Leaf) @ becd099200691927e35a419c9534835db7bf8b31, patch 0052-Skip-event-if-no-listeners.patch.
+Original license: MIT (Leaf LICENSE.md; the patch header states no license).
+Kodama changes: none.
+
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+index 7ce9ebba8ce304d1f3f21d4f15ee5f3560d7700b..2568f8b9255ac37cce57dbd96913d45fd1988be5 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+@@ -36,15 +36,16 @@ class PaperEventManager {
+ 
+     // SimplePluginManager
+     public void callEvent(@NotNull Event event) {
++        // Leaf start - Skip event if no listeners
++        RegisteredListener[] listeners = event.getHandlers().getRegisteredListeners();
++        if (listeners.length == 0) return;
++        // Leaf end - Skip event if no listeners
+         if (event.isAsynchronous() && this.server.isPrimaryThread()) {
+             throw new IllegalStateException(event.getEventName() + " may only be triggered asynchronously.");
+         } else if (!event.isAsynchronous() && !this.server.isPrimaryThread() && !this.server.isStopping()) {
+             throw new IllegalStateException(event.getEventName() + " may only be triggered synchronously.");
+         }
+ 
+-        HandlerList handlers = event.getHandlers();
+-        RegisteredListener[] listeners = handlers.getRegisteredListeners();
+-
+         for (RegisteredListener registration : listeners) {
+             if (!registration.getPlugin().isEnabled()) {
+                 continue;
