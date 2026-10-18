@@ -1,0 +1,1864 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 14:39:00 +0900
+Subject: [PATCH] Kodama configuration
+
+License: GPL-3.0 (https://www.gnu.org/licenses/gpl-3.0.html)
+
+Based on "Gale configuration" from Gale (https://github.com/Dreeam-qwq/Gale), GPL-3.0,
+itself based on "Paper config files" from Paper.
+
+Adds kodama-global.yml, kodama-world-defaults.yml and the per-world
+kodama-world.yml, the safe/balanced/aggressive preset with preset-dependent
+values, validated hot reload and the FeatureGuard exception safety net.
+
+diff --git a/src/main/java/dev/kodama/config/ConfigReloadException.java b/src/main/java/dev/kodama/config/ConfigReloadException.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..34aee1ec01ceb9a27cf997ff54fac2ebd2380c20
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/ConfigReloadException.java
+@@ -0,0 +1,15 @@
++package dev.kodama.config;
++
++/**
++ * Thrown when a config file could not be loaded or failed validation. The previous configuration stays active.
++ */
++public final class ConfigReloadException extends Exception {
++
++    public ConfigReloadException(final String message, final Throwable cause) {
++        super(message, cause);
++    }
++
++    public ConfigReloadException(final String message) {
++        super(message);
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/ConfigSchema.java b/src/main/java/dev/kodama/config/ConfigSchema.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b07696ca1d3903839c13448e3b97b40003748a80
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/ConfigSchema.java
+@@ -0,0 +1,152 @@
++package dev.kodama.config;
++
++import io.papermc.paper.configuration.ConfigurationPart;
++import java.lang.reflect.Field;
++import java.lang.reflect.Modifier;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++import org.spongepowered.configurate.objectmapping.meta.Setting;
++
++/**
++ * Describes the option tree of a config class (dotted paths, types, comments, reload class) by reflection, so the
++ * command can complete and validate paths without knowing the individual options.
++ */
++public final class ConfigSchema {
++
++    public static final ConfigSchema GLOBAL = ConfigSchema.of(KodamaGlobalConfiguration.class);
++    public static final ConfigSchema WORLD = ConfigSchema.of(KodamaWorldConfiguration.class);
++
++    public record Option(String path, List<Field> chain, Field field, @Nullable String comment, ReloadClass reloadClass) {
++
++        public Class<?> valueType() {
++            return this.field.getType();
++        }
++
++        /**
++         * Reads the current value of this option from an instance of the schema's root class.
++         */
++        public @Nullable Object read(final Object root) {
++            Object current = root;
++            try {
++                for (final Field step : this.chain) {
++                    if (current == null) {
++                        return null;
++                    }
++                    current = step.get(current);
++                }
++            } catch (final IllegalAccessException e) {
++                throw new IllegalStateException("Cannot read " + this.path, e);
++            }
++            return current;
++        }
++    }
++
++    private final List<Option> options;
++    private final Map<String, String> comments;
++
++    private ConfigSchema(final List<Option> options, final Map<String, String> comments) {
++        this.options = Collections.unmodifiableList(options);
++        this.comments = Collections.unmodifiableMap(comments);
++    }
++
++    /**
++     * The {@code @Comment} text of every option and section, by dotted path.
++     */
++    public Map<String, String> comments() {
++        return this.comments;
++    }
++
++    public List<Option> options() {
++        return this.options;
++    }
++
++    public @Nullable Option find(final String path) {
++        for (final Option option : this.options) {
++            if (option.path().equals(path)) {
++                return option;
++            }
++        }
++        return null;
++    }
++
++    /**
++     * All options at or below the given path (an option itself, or a section).
++     */
++    public List<Option> under(final String path) {
++        final List<Option> result = new ArrayList<>();
++        for (final Option option : this.options) {
++            if (option.path().equals(path) || option.path().startsWith(path + ".")) {
++                result.add(option);
++            }
++        }
++        return result;
++    }
++
++    public static ConfigSchema of(final Class<? extends ConfigurationPart> root) {
++        final List<Option> options = new ArrayList<>();
++        final Map<String, String> comments = new LinkedHashMap<>();
++        walk(root, "", new ArrayList<>(), options, comments);
++        return new ConfigSchema(options, comments);
++    }
++
++    private static void walk(final Class<?> type, final String prefix, final List<Field> chain, final List<Option> out, final Map<String, String> comments) {
++        for (final Field field : type.getDeclaredFields()) {
++            final int modifiers = field.getModifiers();
++            if (field.isSynthetic() || Modifier.isStatic(modifiers) || Modifier.isTransient(modifiers)) {
++                continue;
++            }
++            final String name = keyOf(field);
++            if (name.startsWith("_")) { // the version field
++                continue;
++            }
++            field.setAccessible(true);
++            final List<Field> path = new ArrayList<>(chain);
++            path.add(field);
++            final String dotted = prefix.isEmpty() ? name : prefix + "." + name;
++            final Comment comment = field.getAnnotation(Comment.class);
++            if (comment != null) {
++                comments.put(dotted, comment.value());
++            }
++            if (ConfigurationPart.class.isAssignableFrom(field.getType())) {
++                walk(field.getType(), dotted, path, out, comments);
++            } else {
++                final ReloadClass reloadClass = field.isAnnotationPresent(RestartRequired.class) ? ReloadClass.RESTART_REQUIRED
++                    : field.isAnnotationPresent(Staged.class) ? ReloadClass.STAGED : ReloadClass.IMMEDIATE;
++                out.add(new Option(dotted, List.copyOf(path), field, comment == null ? null : comment.value(), reloadClass));
++            }
++        }
++    }
++
++    private static String keyOf(final Field field) {
++        final Setting setting = field.getAnnotation(Setting.class);
++        if (setting != null && !setting.value().isEmpty()) {
++            return setting.value();
++        }
++        return kebabCase(field.getName());
++    }
++
++    /**
++     * Matches Configurate's lower-case dashed naming scheme, which the config mapper uses for field names.
++     */
++    static String kebabCase(final String name) {
++        final StringBuilder builder = new StringBuilder(name.length() + 4);
++        for (int i = 0; i < name.length(); i++) {
++            final char c = name.charAt(i);
++            if (Character.isUpperCase(c)) {
++                if (i > 0) {
++                    builder.append('-');
++                }
++                builder.append(Character.toLowerCase(c));
++            } else {
++                builder.append(c);
++            }
++        }
++        return builder.toString().toLowerCase(Locale.ROOT);
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/ConfigTarget.java b/src/main/java/dev/kodama/config/ConfigTarget.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..348e51b00edec6325ef770ade4cdde216536ef4e
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/ConfigTarget.java
+@@ -0,0 +1,37 @@
++package dev.kodama.config;
++
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * One Kodama config file: the global file, the world defaults, or the override file of a single world.
++ */
++public record ConfigTarget(Scope scope, @Nullable String worldName) {
++
++    public enum Scope {
++        GLOBAL,
++        WORLD_DEFAULTS,
++        WORLD
++    }
++
++    public static final ConfigTarget GLOBAL = new ConfigTarget(Scope.GLOBAL, null);
++    public static final ConfigTarget WORLD_DEFAULTS = new ConfigTarget(Scope.WORLD_DEFAULTS, null);
++
++    public static ConfigTarget world(final String worldName) {
++        return new ConfigTarget(Scope.WORLD, worldName);
++    }
++
++    public ConfigSchema schema() {
++        return this.scope == Scope.GLOBAL ? ConfigSchema.GLOBAL : ConfigSchema.WORLD;
++    }
++
++    /**
++     * File name as shown to users and written to the change log.
++     */
++    public String fileName() {
++        return switch (this.scope) {
++            case GLOBAL -> KodamaConfigurations.CONFIG_DIR + "/" + KodamaConfigurations.GLOBAL_CONFIG_FILE_NAME;
++            case WORLD_DEFAULTS -> KodamaConfigurations.CONFIG_DIR + "/" + KodamaConfigurations.WORLD_DEFAULTS_CONFIG_FILE_NAME;
++            case WORLD -> this.worldName + "/" + KodamaConfigurations.WORLD_CONFIG_FILE_NAME;
++        };
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaConfigurations.java b/src/main/java/dev/kodama/config/KodamaConfigurations.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..496e489935184ce1026bd6a104f14620ca65d7fd
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/KodamaConfigurations.java
+@@ -0,0 +1,609 @@
++package dev.kodama.config;
++
++import com.mojang.logging.LogUtils;
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.configuration.Configuration;
++import io.papermc.paper.configuration.ConfigurationPart;
++import io.papermc.paper.configuration.Configurations;
++import io.papermc.paper.configuration.PaperConfigurations;
++import io.papermc.paper.configuration.mapping.InnerClassFieldDiscoverer;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.Modifier;
++import java.lang.reflect.Type;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.function.Function;
++import net.minecraft.core.RegistryAccess;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.slf4j.Logger;
++import org.spongepowered.configurate.ConfigurateException;
++import org.spongepowered.configurate.ConfigurationNode;
++import org.spongepowered.configurate.ConfigurationOptions;
++import org.spongepowered.configurate.NodePath;
++import org.spongepowered.configurate.objectmapping.ObjectMapper;
++import org.spongepowered.configurate.transformation.ConfigurationTransformation;
++import org.spongepowered.configurate.transformation.TransformAction;
++import org.spongepowered.configurate.serialize.SerializationException;
++import org.spongepowered.configurate.util.CheckedConsumer;
++import org.spongepowered.configurate.yaml.YamlConfigurationLoader;
++
++import static io.leangen.geantyref.GenericTypeReflector.erase;
++
++/**
++ * Loads, validates and hot-reloads {@code kodama-global.yml}, {@code kodama-world-defaults.yml} and the per-world
++ * {@code kodama-world.yml}. A reload loads every file into fresh objects first and only swaps them in when all of them
++ * are valid, so a broken file never replaces a working configuration.
++ */
++public class KodamaConfigurations extends Configurations<KodamaGlobalConfiguration, KodamaWorldConfiguration> {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++    public static final String GLOBAL_CONFIG_FILE_NAME = "kodama-global.yml";
++    public static final String WORLD_DEFAULTS_CONFIG_FILE_NAME = "kodama-world-defaults.yml";
++    public static final String WORLD_CONFIG_FILE_NAME = "kodama-world.yml";
++    public static final String CONFIG_DIR = "config";
++
++    private static final List<Runnable> RELOAD_LISTENERS = new CopyOnWriteArrayList<>();
++
++    private static final String GLOBAL_HEADER = String.format("""
++            This is the global configuration file for Kodama.
++            Every feature has an 'enabled' option. Options set to 'default' follow the
++            active preset (safe, balanced or aggressive); write an explicit value to override it.
++
++            The world configuration options are inside the world defaults file (%s)
++            and can be overridden per world in the file named %s inside each world folder.
++
++            Changes can be applied without a restart with /kodama reload,
++            or edited in game with /kodama config set <path> <value>.""", WORLD_DEFAULTS_CONFIG_FILE_NAME, WORLD_CONFIG_FILE_NAME);
++
++    private static final String WORLD_DEFAULTS_HEADER = """
++            This is the world defaults configuration file for Kodama.
++            Every feature has an 'enabled' option. Options set to 'default' follow the
++            preset chosen in kodama-global.yml; write an explicit value to override it.
++
++            Configuration options here apply to all worlds, unless you specify overrides inside
++            the world-specific config file inside each world folder.""";
++
++    private static final Function<ContextMap, String> WORLD_HEADER = map -> String.format("""
++        This is a world configuration file for Kodama.
++        This file may start empty but can be filled with settings to override ones in the %s/%s
++
++        World: %s (%s)""",
++        CONFIG_DIR,
++        WORLD_DEFAULTS_CONFIG_FILE_NAME,
++        map.require(WORLD_NAME),
++        map.require(WORLD_KEY)
++    );
++
++    /**
++     * Result of a successful reload.
++     *
++     * @param pendingRestart options (with the world name for world options) whose value changed but only take effect
++     *                       after a restart
++     */
++    public record ReloadReport(List<String> pendingRestart) {
++    }
++
++    /**
++     * Result of editing one option.
++     *
++     * @param oldRaw   the raw value that was in the file before ({@code null} when the key was not in the file)
++     * @param newRaw   the raw value written ({@code null} when the key was removed)
++     * @param oldValue the resolved value before the edit
++     * @param newValue the resolved value after the edit
++     */
++    public record EditOutcome(@Nullable Object oldRaw, @Nullable Object newRaw, @Nullable Object oldValue, @Nullable Object newValue) {
++    }
++
++    public KodamaConfigurations(final Path globalFolder) {
++        super(globalFolder, KodamaGlobalConfiguration.class, KodamaWorldConfiguration.class, GLOBAL_CONFIG_FILE_NAME, WORLD_DEFAULTS_CONFIG_FILE_NAME, WORLD_CONFIG_FILE_NAME);
++    }
++
++    public static KodamaConfigurations setup(final Path configDir) throws Exception {
++        try {
++            PaperConfigurations.createDirectoriesSymlinkAware(configDir);
++            return new KodamaConfigurations(configDir);
++        } catch (final IOException ex) {
++            throw new RuntimeException("Could not setup KodamaConfigurations", ex);
++        }
++    }
++
++    // reload listeners
++
++    /**
++     * Registers a hook that runs on the main thread after every successful reload, config edit and automatic feature
++     * shutdown, so staged features can move to their new state.
++     */
++    public static void addReloadListener(final Runnable listener) {
++        RELOAD_LISTENERS.add(listener);
++    }
++
++    public static void removeReloadListener(final Runnable listener) {
++        RELOAD_LISTENERS.remove(listener);
++    }
++
++    /**
++     * Runs the reload listeners on the main thread (immediately when already on it).
++     */
++    public static void fireReloadListeners() {
++        final Runnable fire = () -> {
++            for (final Runnable listener : RELOAD_LISTENERS) {
++                try {
++                    listener.run();
++                } catch (final Throwable throwable) {
++                    LOGGER.error("A Kodama reload listener failed", throwable);
++                }
++            }
++        };
++        final MinecraftServer server = MinecraftServer.getServer();
++        if (server == null || server.isSameThread()) {
++            fire.run();
++        } else {
++            server.execute(fire);
++        }
++    }
++
++    // loader setup
++
++    @Override
++    protected YamlConfigurationLoader.Builder createLoaderBuilder() {
++        return super.createLoaderBuilder()
++            .defaultOptions(KodamaConfigurations::defaultOptions);
++    }
++
++    private static ConfigurationOptions defaultOptions(final ConfigurationOptions options) {
++        return options.serializers(builder -> builder
++            .register(new KodamaEnumSerializer())
++            .register(PresetBoolean.SERIALIZER)
++            .register(PresetInt.SERIALIZER)
++            .register(PresetDouble.SERIALIZER)
++        );
++    }
++
++    @Override
++    protected ObjectMapper.Factory.Builder createGlobalObjectMapperFactoryBuilder() {
++        return super.createGlobalObjectMapperFactoryBuilder().addDiscoverer(InnerClassFieldDiscoverer.globalConfig());
++    }
++
++    @Override
++    protected YamlConfigurationLoader.Builder createGlobalLoaderBuilder() {
++        return super.createGlobalLoaderBuilder()
++            .defaultOptions(options -> options.header(GLOBAL_HEADER));
++    }
++
++    @Override
++    protected ObjectMapper.Factory.Builder createWorldObjectMapperFactoryBuilder(final ContextMap contextMap) {
++        return super.createWorldObjectMapperFactoryBuilder(contextMap)
++            .addDiscoverer(InnerClassFieldDiscoverer.kodamaWorldConfig(contextMap));
++    }
++
++    @Override
++    protected YamlConfigurationLoader.Builder createWorldConfigLoaderBuilder(final ContextMap contextMap) {
++        return super.createWorldConfigLoaderBuilder(contextMap)
++            .defaultOptions(options -> options
++                .header(contextMap.require(WORLD_NAME).equals(WORLD_DEFAULTS) ? WORLD_DEFAULTS_HEADER : WORLD_HEADER.apply(contextMap)));
++    }
++
++    @Override
++    protected boolean isConfigType(final Type type) {
++        return ConfigurationPart.class.isAssignableFrom(erase(type));
++    }
++
++    @Override
++    protected int globalConfigVersion() {
++        return KodamaGlobalConfiguration.CURRENT_VERSION;
++    }
++
++    @Override
++    protected int worldConfigVersion() {
++        return KodamaWorldConfiguration.CURRENT_VERSION;
++    }
++
++    @Override
++    protected void applyWorldConfigTransformations(final ContextMap contextMap, final ConfigurationNode node, final @Nullable ConfigurationNode defaultsNode) throws ConfigurateException {
++        removePaths(node, KodamaRemovedConfigurations.REMOVED_WORLD_PATHS);
++    }
++
++    @Override
++    protected void applyGlobalConfigTransformations(final ConfigurationNode node) throws ConfigurateException {
++        removePaths(node, KodamaRemovedConfigurations.REMOVED_GLOBAL_PATHS);
++    }
++
++    private static void removePaths(final ConfigurationNode node, final NodePath[] paths) throws ConfigurateException {
++        if (paths.length == 0) {
++            return;
++        }
++        final ConfigurationTransformation.Builder builder = ConfigurationTransformation.builder();
++        for (final NodePath path : paths) {
++            builder.addAction(path, TransformAction.remove());
++        }
++        builder.build().apply(node);
++    }
++
++    /**
++     * Configurate's YAML loader cannot write {@code @Comment} texts, so they are added to the saved file afterwards.
++     */
++    @Override
++    protected void trySaveFileNode(final YamlConfigurationLoader loader, final ConfigurationNode node, final String filename) throws ConfigurateException {
++        super.trySaveFileNode(loader, node, filename);
++        try {
++            final ConfigSchema schema = filename.endsWith(GLOBAL_CONFIG_FILE_NAME) ? ConfigSchema.GLOBAL : ConfigSchema.WORLD;
++            YamlComments.inject(Path.of(filename), schema.comments());
++        } catch (final IOException exception) {
++            LOGGER.warn("Could not add the comments to {}", filename, exception);
++        }
++    }
++
++    // startup loading
++
++    @Override
++    public KodamaGlobalConfiguration initializeGlobalConfiguration(final RegistryAccess registryAccess) throws ConfigurateException {
++        final KodamaGlobalConfiguration configuration = this.loadGlobal(null);
++        KodamaGlobalConfiguration.set(configuration);
++        return configuration;
++    }
++
++    @Override
++    public void initializeWorldDefaultsConfiguration(final RegistryAccess registryAccess) throws ConfigurateException {
++        this.loadWorldDefaults(registryAccess, null, true);
++    }
++
++    @Override
++    public KodamaWorldConfiguration createWorldConfig(final ContextMap contextMap) {
++        final String levelName = contextMap.require(WORLD_NAME);
++        try {
++            return this.loadWorldOverride(contextMap, null, true);
++        } catch (final IOException exception) {
++            throw new RuntimeException("Could not create Kodama world config for " + levelName, exception);
++        }
++    }
++
++    // fresh loading: every call builds new loaders and therefore new config objects
++
++    private KodamaGlobalConfiguration loadGlobal(final @Nullable CheckedConsumer<ConfigurationNode, SerializationException> mutator) throws ConfigurateException {
++        return this.initializeGlobalConfiguration(node -> {
++            if (mutator != null) {
++                mutator.accept(node);
++            }
++            final KodamaGlobalConfiguration instance = node.require(KodamaGlobalConfiguration.class);
++            node.set(KodamaGlobalConfiguration.class, instance);
++            return instance;
++        });
++    }
++
++    private KodamaWorldConfiguration loadWorldDefaults(final RegistryAccess registryAccess, final @Nullable CheckedConsumer<ConfigurationNode, SerializationException> mutator, final boolean save) throws ConfigurateException {
++        final ContextMap contextMap = this.createDefaultContextMap(registryAccess).put(FIRST_DEFAULT).build();
++        final Path configFile = this.globalFolder.resolve(this.defaultWorldConfigFileName);
++        final boolean newFile = Files.notExists(configFile);
++        final YamlConfigurationLoader loader = this.createWorldConfigLoaderBuilder(contextMap)
++            .defaultOptions(this.applyObjectMapperFactory(this.createWorldObjectMapperFactoryBuilder(contextMap).build()))
++            .path(configFile)
++            .build();
++        final ConfigurationNode node = loader.load();
++        if (newFile) {
++            node.node(Configuration.VERSION_FIELD).raw(this.worldConfigVersion());
++        } else {
++            this.verifyWorldConfigVersion(contextMap, node);
++        }
++        this.applyWorldConfigTransformations(contextMap, node, null);
++        if (mutator != null) {
++            mutator.accept(node);
++        }
++        final KodamaWorldConfiguration instance = node.require(this.worldConfigClass);
++        if (save) {
++            node.set(this.worldConfigClass, instance);
++            this.trySaveFileNode(loader, node, configFile.toString());
++        }
++        return instance;
++    }
++
++    private KodamaWorldConfiguration loadWorldOverride(final ContextMap contextMap, final @Nullable CheckedConsumer<ConfigurationNode, SerializationException> mutator, final boolean save) throws IOException {
++        final ContextMap defaultsContext = this.createDefaultContextMap(contextMap.require(REGISTRY_ACCESS)).build();
++        final Path defaultsFile = this.globalFolder.resolve(this.defaultWorldConfigFileName);
++        final ConfigurationNode defaultsNode = this.createWorldConfigLoaderBuilder(defaultsContext)
++            .defaultOptions(this.applyObjectMapperFactory(this.createWorldObjectMapperFactoryBuilder(defaultsContext).build()))
++            .path(defaultsFile)
++            .build()
++            .load();
++
++        final Path worldDirectory = contextMap.require(WORLD_DIRECTORY);
++        final Path worldConfigFile = worldDirectory.resolve(this.worldConfigFileName);
++        boolean newFile = false;
++        if (Files.notExists(worldConfigFile)) {
++            if (save) {
++                PaperConfigurations.createDirectoriesSymlinkAware(worldDirectory);
++                Files.createFile(worldConfigFile);
++            }
++            newFile = true;
++        }
++        final YamlConfigurationLoader worldLoader = this.createWorldConfigLoaderBuilder(contextMap)
++            .defaultOptions(this.applyObjectMapperFactory(this.createWorldObjectMapperFactoryBuilder(contextMap).build()))
++            .path(worldConfigFile)
++            .build();
++        final ConfigurationNode worldNode = worldLoader.load();
++        if (newFile) {
++            worldNode.node(Configuration.VERSION_FIELD).set(this.worldConfigVersion());
++        } else {
++            this.verifyWorldConfigVersion(contextMap, worldNode);
++        }
++        this.applyWorldConfigTransformations(contextMap, worldNode, defaultsNode);
++        this.applyDefaultsAwareWorldConfigTransformations(contextMap, worldNode, defaultsNode);
++        if (mutator != null) {
++            mutator.accept(worldNode);
++        }
++        final ConfigurationNode merged = worldNode.copy(); // the node that is saved must stay free of the defaults
++        merged.mergeFrom(defaultsNode);
++        final KodamaWorldConfiguration instance = merged.require(this.worldConfigClass);
++        if (save) {
++            this.trySaveFileNode(worldLoader, worldNode, worldConfigFile.toString());
++        }
++        return instance;
++    }
++
++    // reload
++
++    /**
++     * Reloads all Kodama configs (global, world defaults, every world). Must be called on the main thread, which is
++     * between two ticks.
++     *
++     * @throws ConfigReloadException when any file fails to load or validate; nothing has been changed in that case
++     */
++    public ReloadReport reloadAll(final MinecraftServer server, final boolean resetFeatureGuard) throws ConfigReloadException {
++        requireMainThread(server);
++        final KodamaGlobalConfiguration global;
++        try {
++            global = this.initializeGlobalConfiguration(node -> node.require(KodamaGlobalConfiguration.class));
++        } catch (final Exception exception) {
++            throw failure(ConfigTarget.GLOBAL.fileName(), exception);
++        }
++        final Map<ServerLevel, KodamaWorldConfiguration> worlds = this.prepareWorlds(server);
++
++        final Set<String> before = restartSnapshot(server);
++        KodamaGlobalConfiguration.set(global);
++        applyWorlds(worlds);
++        final Set<String> after = restartSnapshot(server);
++
++        if (resetFeatureGuard) {
++            FeatureGuard.resetAll();
++        }
++        this.saveAllQuietly(server);
++        fireReloadListeners();
++
++        final Set<String> changed = new LinkedHashSet<>(after);
++        changed.removeAll(before);
++        final List<String> pending = new ArrayList<>();
++        for (final String entry : changed) {
++            pending.add(entry.substring(0, entry.lastIndexOf('=')));
++        }
++        return new ReloadReport(pending);
++    }
++
++    /**
++     * Used by the Bukkit {@code /reload}; a failing reload keeps the old configuration and is only logged.
++     */
++    public void reloadQuietly(final MinecraftServer server) {
++        try {
++            this.reloadAll(server, false);
++        } catch (final ConfigReloadException exception) {
++            LOGGER.error("Could not reload the Kodama configuration, keeping the previous one: {}", exception.getMessage(), exception.getCause());
++        }
++    }
++
++    private Map<ServerLevel, KodamaWorldConfiguration> prepareWorlds(final MinecraftServer server) throws ConfigReloadException {
++        try {
++            this.loadWorldDefaults(server.registryAccess(), null, false);
++        } catch (final Exception exception) {
++            throw failure(ConfigTarget.WORLD_DEFAULTS.fileName(), exception);
++        }
++        final Map<ServerLevel, KodamaWorldConfiguration> worlds = new LinkedHashMap<>();
++        for (final ServerLevel level : server.getAllLevels()) {
++            try {
++                worlds.put(level, this.loadWorldOverride(PaperConfigurations.createWorldContextMap(level), null, false));
++            } catch (final Exception exception) {
++                throw failure(level.getWorld().getName() + "/" + WORLD_CONFIG_FILE_NAME, exception);
++            }
++        }
++        return worlds;
++    }
++
++    private static void applyWorlds(final Map<ServerLevel, KodamaWorldConfiguration> worlds) {
++        for (final Map.Entry<ServerLevel, KodamaWorldConfiguration> entry : worlds.entrySet()) {
++            copyFields(entry.getValue(), entry.getKey().kodamaConfig());
++        }
++    }
++
++    /**
++     * Rewrites the files so options added since the last start show up with their comments, like Paper does.
++     */
++    private void saveAllQuietly(final MinecraftServer server) {
++        try {
++            this.loadGlobal(null);
++            this.loadWorldDefaults(server.registryAccess(), null, true);
++            for (final ServerLevel level : server.getAllLevels()) {
++                this.loadWorldOverride(PaperConfigurations.createWorldContextMap(level), null, true);
++            }
++        } catch (final Exception exception) {
++            LOGGER.warn("Could not rewrite the Kodama config files after reload", exception);
++        }
++    }
++
++    // editing
++
++    /**
++     * Writes one option into a config file and reloads that config in place. The file is only written when the
++     * resulting config is valid.
++     *
++     * @param newRaw the raw value to write, or {@code null} to remove the key from the file
++     */
++    public EditOutcome edit(final MinecraftServer server, final ConfigTarget target, final ConfigSchema.Option option, final @Nullable Object newRaw) throws ConfigReloadException {
++        requireMainThread(server);
++        final String[] segments = option.path().split("\\.");
++        final Object[] oldRaw = new Object[1];
++        final CheckedConsumer<ConfigurationNode, SerializationException> mutator = node -> {
++            final ConfigurationNode leaf = node.node((Object[]) segments);
++            oldRaw[0] = leaf.virtual() ? null : leaf.raw();
++            leaf.raw(newRaw);
++            for (int depth = segments.length - 1; newRaw == null && depth > 0; depth--) { // do not leave empty sections behind
++                final ConfigurationNode parent = node.node((Object[]) Arrays.copyOf(segments, depth));
++                if (!parent.childrenMap().isEmpty()) {
++                    break;
++                }
++                parent.raw(null);
++            }
++        };
++        final Object oldValue;
++        final Object newValue;
++        switch (target.scope()) {
++            case GLOBAL -> {
++                oldValue = option.read(KodamaGlobalConfiguration.get());
++                final KodamaGlobalConfiguration fresh;
++                try {
++                    fresh = this.loadGlobal(mutator);
++                } catch (final Exception exception) {
++                    throw failure(target.fileName(), exception);
++                }
++                KodamaGlobalConfiguration.set(fresh);
++                newValue = option.read(fresh);
++            }
++            case WORLD_DEFAULTS -> {
++                final KodamaWorldConfiguration fresh;
++                try {
++                    oldValue = option.read(this.loadWorldDefaults(server.registryAccess(), null, false));
++                    fresh = this.loadWorldDefaults(server.registryAccess(), mutator, true);
++                } catch (final Exception exception) {
++                    throw failure(target.fileName(), exception);
++                }
++                newValue = option.read(fresh);
++                applyWorlds(this.prepareWorlds(server)); // every world inherits from the defaults
++            }
++            case WORLD -> {
++                final ServerLevel level = levelByName(server, target.worldName());
++                if (level == null) {
++                    throw new ConfigReloadException("World '" + target.worldName() + "' is not loaded");
++                }
++                oldValue = option.read(level.kodamaConfig());
++                final KodamaWorldConfiguration fresh;
++                try {
++                    fresh = this.loadWorldOverride(PaperConfigurations.createWorldContextMap(level), mutator, true);
++                } catch (final Exception exception) {
++                    throw failure(target.fileName(), exception);
++                }
++                copyFields(fresh, level.kodamaConfig());
++                newValue = option.read(level.kodamaConfig());
++            }
++            default -> throw new IllegalStateException();
++        }
++        fireReloadListeners();
++        return new EditOutcome(oldRaw[0], newRaw, oldValue, newValue);
++    }
++
++    /**
++     * The current resolved value of an option as the running server sees it; for the world defaults this reads the
++     * file, because no live object exists for them.
++     */
++    public @Nullable Object currentValue(final MinecraftServer server, final ConfigTarget target, final ConfigSchema.Option option) throws ConfigReloadException {
++        switch (target.scope()) {
++            case GLOBAL -> {
++                return option.read(KodamaGlobalConfiguration.get());
++            }
++            case WORLD_DEFAULTS -> {
++                try {
++                    return option.read(this.loadWorldDefaults(server.registryAccess(), null, false));
++                } catch (final Exception exception) {
++                    throw failure(target.fileName(), exception);
++                }
++            }
++            default -> {
++                final ServerLevel level = levelByName(server, target.worldName());
++                if (level == null) {
++                    throw new ConfigReloadException("World '" + target.worldName() + "' is not loaded");
++                }
++                return option.read(level.kodamaConfig());
++            }
++        }
++    }
++
++    public static @Nullable ServerLevel levelByName(final MinecraftServer server, final @Nullable String name) {
++        for (final ServerLevel level : server.getAllLevels()) {
++            if (level.getWorld().getName().equals(name)) {
++                return level;
++            }
++        }
++        return null;
++    }
++
++    // helpers
++
++    /**
++     * Snapshot of all restart-required options, as {@code "<path>[ (world X)]=<value>"} entries.
++     */
++    private static Set<String> restartSnapshot(final MinecraftServer server) {
++        final Set<String> snapshot = new HashSet<>();
++        for (final ConfigSchema.Option option : ConfigSchema.GLOBAL.options()) {
++            if (option.reloadClass() == ReloadClass.RESTART_REQUIRED) {
++                snapshot.add(option.path() + "=" + option.read(KodamaGlobalConfiguration.get()));
++            }
++        }
++        for (final ServerLevel level : server.getAllLevels()) {
++            for (final ConfigSchema.Option option : ConfigSchema.WORLD.options()) {
++                if (option.reloadClass() == ReloadClass.RESTART_REQUIRED) {
++                    snapshot.add(option.path() + " (world " + level.getWorld().getName() + ")=" + option.read(level.kodamaConfig()));
++                }
++            }
++        }
++        return snapshot;
++    }
++
++    private static void copyFields(final Object from, final Object to) {
++        for (Class<?> type = from.getClass(); type != null && type != Object.class; type = type.getSuperclass()) {
++            for (final Field field : type.getDeclaredFields()) {
++                final int modifiers = field.getModifiers();
++                if (field.isSynthetic() || Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers) || Modifier.isTransient(modifiers)) {
++                    continue;
++                }
++                try {
++                    field.setAccessible(true);
++                    field.set(to, field.get(from));
++                } catch (final IllegalAccessException e) {
++                    throw new IllegalStateException("Cannot copy " + field, e);
++                }
++            }
++        }
++    }
++
++    private static void requireMainThread(final MinecraftServer server) {
++        if (!server.isSameThread()) {
++            throw new IllegalStateException("Kodama configs may only be reloaded or edited on the main thread");
++        }
++    }
++
++    private static ConfigReloadException failure(final String file, final Throwable throwable) {
++        return new ConfigReloadException(file + ": " + describe(throwable), throwable);
++    }
++
++    /**
++     * Joins the distinct messages of a cause chain; Configurate wraps the useful part (for example a violated
++     * constraint) several levels deep.
++     */
++    public static String describe(final Throwable throwable) {
++        final Set<String> messages = new LinkedHashSet<>();
++        for (Throwable current = throwable; current != null; current = current.getCause()) {
++            final String message = current.getMessage();
++            if (message != null && !message.isBlank()) {
++                messages.add(message.strip().replace('\n', ' '));
++            }
++        }
++        return messages.isEmpty() ? throwable.getClass().getSimpleName() : String.join(" / ", messages);
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaEnumSerializer.java b/src/main/java/dev/kodama/config/KodamaEnumSerializer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb692de1924519260e9effdea9c4d156a342497a
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/KodamaEnumSerializer.java
+@@ -0,0 +1,44 @@
++package dev.kodama.config;
++
++import io.leangen.geantyref.TypeToken;
++import java.lang.reflect.Type;
++import java.util.Arrays;
++import java.util.Locale;
++import java.util.function.Predicate;
++import java.util.stream.Collectors;
++import org.spongepowered.configurate.serialize.ScalarSerializer;
++import org.spongepowered.configurate.serialize.SerializationException;
++
++import static io.leangen.geantyref.GenericTypeReflector.erase;
++
++/**
++ * Writes enums as lower-case dashed names and rejects unknown values, so an invalid value fails validation instead of
++ * silently falling back to a default.
++ */
++final class KodamaEnumSerializer extends ScalarSerializer<Enum<?>> {
++
++    KodamaEnumSerializer() {
++        super(new TypeToken<Enum<?>>() {});
++    }
++
++    static String keyOf(final Enum<?> constant) {
++        return constant.name().toLowerCase(Locale.ROOT).replace('_', '-');
++    }
++
++    @Override
++    public Enum<?> deserialize(final Type type, final Object obj) throws SerializationException {
++        final String wanted = obj.toString().trim().toLowerCase(Locale.ROOT).replace('_', '-');
++        final Enum<?>[] constants = erase(type).asSubclass(Enum.class).getEnumConstants();
++        for (final Enum<?> constant : constants) {
++            if (keyOf(constant).equals(wanted)) {
++                return constant;
++            }
++        }
++        throw new SerializationException("'" + obj + "' is not one of: " + Arrays.stream(constants).map(KodamaEnumSerializer::keyOf).collect(Collectors.joining(", ")));
++    }
++
++    @Override
++    protected Object serialize(final Enum<?> item, final Predicate<Class<?>> typeSupported) {
++        return keyOf(item);
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e97481e0174fe1f48b444ff3b75d8ebc901a1a41
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -0,0 +1,77 @@
++package dev.kodama.config;
++
++import io.papermc.paper.configuration.Configuration;
++import io.papermc.paper.configuration.ConfigurationPart;
++import io.papermc.paper.configuration.constraint.Constraint;
++import io.papermc.paper.configuration.constraint.Constraints;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++import org.spongepowered.configurate.objectmapping.meta.Setting;
++
++@SuppressWarnings({"CanBeFinal", "FieldCanBeLocal", "FieldMayBeFinal", "NotNullFieldNotInitialized", "InnerClassMayBeStatic"})
++public class KodamaGlobalConfiguration extends ConfigurationPart {
++    static final int CURRENT_VERSION = 1;
++    private static volatile KodamaGlobalConfiguration instance;
++
++    public static KodamaGlobalConfiguration get() {
++        return instance;
++    }
++
++    static void set(final KodamaGlobalConfiguration instance) {
++        KodamaGlobalConfiguration.instance = instance;
++    }
++
++    /**
++     * The active preset, or {@link Preset#BALANCED} while the configuration is not loaded yet.
++     */
++    public static Preset currentPreset() {
++        final KodamaGlobalConfiguration current = instance;
++        return current == null || current.preset == null ? Preset.BALANCED : current.preset;
++    }
++
++    @Setting(Configuration.VERSION_FIELD)
++    public int version = CURRENT_VERSION;
++
++    @Comment("Decides the default of every option written as 'default' in the Kodama config files.\n"
++        + "safe: only optimizations that never change vanilla behavior.\n"
++        + "balanced: the recommended behavior.\n"
++        + "aggressive: prefers speed over matching vanilla statistics.\n"
++        + "Options you set explicitly always win over the preset.")
++    public Preset preset = Preset.BALANCED;
++
++    @Comment("Automatically disables a single Kodama feature when it keeps throwing exceptions. The server keeps running.")
++    public FeatureSafety featureSafety;
++
++    public class FeatureSafety extends ConfigurationPart {
++        @Comment("How many exceptions a feature may throw inside the window before it is disabled until the next /kodama reload.")
++        @Constraint(Constraints.Positive.class)
++        public int maxExceptions = 20;
++
++        @Comment("Length of the sliding window, in seconds, used to count exceptions.")
++        @Constraint(Constraints.Positive.class)
++        public int windowSeconds = 60;
++    }
++
++    @Comment("Chunk loading and chunk sending optimizations.")
++    public ChunkLoading chunkLoading;
++
++    public class ChunkLoading extends ConfigurationPart {
++        @Comment("Enables the chunk loading optimizations.")
++        public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++    }
++
++    @Comment("Network and packet optimizations.")
++    public Network network;
++
++    public class Network extends ConfigurationPart {
++        @Comment("Enables the network optimizations.")
++        public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++    }
++
++    @Comment("Background pre-caching of chunk data.")
++    public Precache precache;
++
++    public class Precache extends ConfigurationPart {
++        @Comment("Enables pre-caching.")
++        public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaRemovedConfigurations.java b/src/main/java/dev/kodama/config/KodamaRemovedConfigurations.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8793939beb41c164dc6cca4466fd491204c4a561
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/KodamaRemovedConfigurations.java
+@@ -0,0 +1,11 @@
++package dev.kodama.config;
++
++import org.spongepowered.configurate.NodePath;
++
++interface KodamaRemovedConfigurations {
++
++    NodePath[] REMOVED_WORLD_PATHS = {};
++
++    NodePath[] REMOVED_GLOBAL_PATHS = {};
++
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b325e792d63dece944230d0bce9fd94787cc8407
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+@@ -0,0 +1,56 @@
++package dev.kodama.config;
++
++import io.papermc.paper.configuration.Configuration;
++import io.papermc.paper.configuration.ConfigurationPart;
++import io.papermc.paper.configuration.Configurations;
++import net.minecraft.resources.ResourceLocation;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++import org.spongepowered.configurate.objectmapping.meta.Setting;
++
++@SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal", "NotNullFieldNotInitialized", "InnerClassMayBeStatic"})
++public class KodamaWorldConfiguration extends ConfigurationPart {
++    public static final int CURRENT_VERSION = 1;
++
++    private transient final ResourceLocation worldKey;
++    private transient final String worldName;
++
++    public KodamaWorldConfiguration(final ResourceLocation worldKey, final String worldName) {
++        this.worldKey = worldKey;
++        this.worldName = worldName;
++    }
++
++    public boolean isDefault() {
++        return this.worldKey.equals(Configurations.WORLD_DEFAULTS_KEY);
++    }
++
++    public String worldName() {
++        return this.worldName;
++    }
++
++    @Setting(Configuration.VERSION_FIELD)
++    public int version = CURRENT_VERSION;
++
++    @Comment("Level of detail for distant mobs.")
++    public MobLod mobLod;
++
++    public class MobLod extends ConfigurationPart {
++        @Comment("Enables mob level of detail in this world.")
++        public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++    }
++
++    @Comment("Redstone optimizations.")
++    public Redstone redstone;
++
++    public class Redstone extends ConfigurationPart {
++        @Comment("Enables the redstone optimizations in this world.")
++        public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++    }
++
++    @Comment("Hopper optimizations.")
++    public Hoppers hoppers;
++
++    public class Hoppers extends ConfigurationPart {
++        @Comment("Enables the hopper optimizations in this world.")
++        public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/Preset.java b/src/main/java/dev/kodama/config/Preset.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf0789181d018f21e4beec7bca3ae450dbbdb1d2
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/Preset.java
+@@ -0,0 +1,23 @@
++package dev.kodama.config;
++
++import java.util.Locale;
++
++/**
++ * Global preset that decides the value of every {@link PresetValue} the user has not set explicitly.
++ */
++public enum Preset {
++    /** Only optimizations that never change vanilla behavior. */
++    SAFE,
++    /** The default: the behavior described in the design document. */
++    BALANCED,
++    /** Prefers speed over statistical equality with vanilla. */
++    AGGRESSIVE;
++
++    public String key() {
++        return this.name().toLowerCase(Locale.ROOT);
++    }
++
++    public static Preset current() {
++        return KodamaGlobalConfiguration.currentPreset();
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/PresetBoolean.java b/src/main/java/dev/kodama/config/PresetBoolean.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..50f1c0bf6799d65594885ae2816aa261e0508e72
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/PresetBoolean.java
+@@ -0,0 +1,48 @@
++package dev.kodama.config;
++
++import java.lang.reflect.Type;
++import java.util.List;
++import java.util.Locale;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.spongepowered.configurate.serialize.ScalarSerializer;
++import org.spongepowered.configurate.serialize.SerializationException;
++
++public final class PresetBoolean extends PresetValue<Boolean> {
++
++    public static final ScalarSerializer<PresetBoolean> SERIALIZER = new Serializer();
++
++    private PresetBoolean(final @Nullable Boolean explicit, final @Nullable List<Boolean> defaults) {
++        super(explicit, defaults);
++    }
++
++    public static PresetBoolean of(final boolean safe, final boolean balanced, final boolean aggressive) {
++        return new PresetBoolean(null, List.of(safe, balanced, aggressive));
++    }
++
++    public boolean isTrue() {
++        return this.get();
++    }
++
++    private static final class Serializer extends PresetValue.Serializer<PresetBoolean, Boolean> {
++        private Serializer() {
++            super(PresetBoolean.class, explicit -> new PresetBoolean(explicit, null));
++        }
++
++        @Override
++        protected Boolean parse(final Type type, final Object obj) throws SerializationException {
++            if (obj instanceof Boolean bool) {
++                return bool;
++            }
++            if (obj instanceof String string) {
++                final String lower = string.trim().toLowerCase(Locale.ROOT);
++                if (lower.equals("true")) {
++                    return true;
++                }
++                if (lower.equals("false")) {
++                    return false;
++                }
++            }
++            throw new SerializationException(PresetBoolean.class, "'" + obj + "' is not true, false or '" + DEFAULT_VALUE + "'");
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/PresetDouble.java b/src/main/java/dev/kodama/config/PresetDouble.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa6a32b3f5ee1fc4e4cdc7e9a78f873d3fd95f58
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/PresetDouble.java
+@@ -0,0 +1,43 @@
++package dev.kodama.config;
++
++import java.lang.reflect.Type;
++import java.util.List;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.spongepowered.configurate.serialize.ScalarSerializer;
++import org.spongepowered.configurate.serialize.SerializationException;
++
++public final class PresetDouble extends PresetValue<Double> {
++
++    public static final ScalarSerializer<PresetDouble> SERIALIZER = new Serializer();
++
++    private PresetDouble(final @Nullable Double explicit, final @Nullable List<Double> defaults) {
++        super(explicit, defaults);
++    }
++
++    public static PresetDouble of(final double safe, final double balanced, final double aggressive) {
++        return new PresetDouble(null, List.of(safe, balanced, aggressive));
++    }
++
++    public double getAsDouble() {
++        return this.get();
++    }
++
++    private static final class Serializer extends PresetValue.Serializer<PresetDouble, Double> {
++        private Serializer() {
++            super(PresetDouble.class, explicit -> new PresetDouble(explicit, null));
++        }
++
++        @Override
++        protected Double parse(final Type type, final Object obj) throws SerializationException {
++            try {
++                final double value = obj instanceof Number number ? number.doubleValue() : Double.parseDouble(obj.toString().trim());
++                if (Double.isNaN(value) || Double.isInfinite(value)) {
++                    throw new SerializationException(PresetDouble.class, "'" + obj + "' is not a finite number");
++                }
++                return value;
++            } catch (final NumberFormatException ex) {
++                throw new SerializationException(PresetDouble.class, "'" + obj + "' is not a number or '" + DEFAULT_VALUE + "'");
++            }
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/PresetInt.java b/src/main/java/dev/kodama/config/PresetInt.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2ba06b9e6285d54e22195cd9055b4eddaea9888
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/PresetInt.java
+@@ -0,0 +1,45 @@
++package dev.kodama.config;
++
++import java.lang.reflect.Type;
++import java.util.List;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.spongepowered.configurate.serialize.ScalarSerializer;
++import org.spongepowered.configurate.serialize.SerializationException;
++
++public final class PresetInt extends PresetValue<Integer> {
++
++    public static final ScalarSerializer<PresetInt> SERIALIZER = new Serializer();
++
++    private PresetInt(final @Nullable Integer explicit, final @Nullable List<Integer> defaults) {
++        super(explicit, defaults);
++    }
++
++    public static PresetInt of(final int safe, final int balanced, final int aggressive) {
++        return new PresetInt(null, List.of(safe, balanced, aggressive));
++    }
++
++    public int getAsInt() {
++        return this.get();
++    }
++
++    private static final class Serializer extends PresetValue.Serializer<PresetInt, Integer> {
++        private Serializer() {
++            super(PresetInt.class, explicit -> new PresetInt(explicit, null));
++        }
++
++        @Override
++        protected Integer parse(final Type type, final Object obj) throws SerializationException {
++            try {
++                if (obj instanceof Number number) {
++                    if (number.intValue() != number.doubleValue()) {
++                        throw new SerializationException(PresetInt.class, number + " is not a whole number");
++                    }
++                    return number.intValue();
++                }
++                return Integer.parseInt(obj.toString().trim());
++            } catch (final NumberFormatException ex) {
++                throw new SerializationException(PresetInt.class, "'" + obj + "' is not a whole number or '" + DEFAULT_VALUE + "'");
++            }
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/PresetValue.java b/src/main/java/dev/kodama/config/PresetValue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..120fcab329697e2d5171cd47828836f74997ecac
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/PresetValue.java
+@@ -0,0 +1,106 @@
++package dev.kodama.config;
++
++import java.lang.reflect.Type;
++import java.util.List;
++import java.util.function.Function;
++import java.util.function.Predicate;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.spongepowered.configurate.serialize.ScalarSerializer;
++import org.spongepowered.configurate.serialize.SerializationException;
++
++/**
++ * A config value whose default depends on the active {@link Preset}.
++ * <p>
++ * In the file it is the literal {@code default} unless the user wrote an explicit value. The per-preset defaults are
++ * declared where the field is initialized, for example {@code PresetBoolean.of(false, true, true)}; a deserialized
++ * instance only knows the explicit value and takes the defaults over from the initial field value
++ * (see {@link #inheritDefaults(PresetValue)}).
++ */
++public abstract class PresetValue<T> {
++
++    public static final String DEFAULT_VALUE = "default";
++
++    protected final @Nullable T explicit;
++    private @Nullable List<T> defaults; // indexed by Preset#ordinal
++
++    protected PresetValue(final @Nullable T explicit, final @Nullable List<T> defaults) {
++        this.explicit = explicit;
++        this.defaults = defaults;
++    }
++
++    public final T get() {
++        final T explicit = this.explicit;
++        return explicit != null ? explicit : this.defaultFor(Preset.current());
++    }
++
++    public final T defaultFor(final Preset preset) {
++        if (this.defaults == null) {
++            throw new IllegalStateException("Preset defaults were never bound to this value");
++        }
++        return this.defaults.get(preset.ordinal());
++    }
++
++    public final @Nullable T explicit() {
++        return this.explicit;
++    }
++
++    public final boolean isDefault() {
++        return this.explicit == null;
++    }
++
++    /**
++     * Called by the config mapper right after deserialization; do not call from feature code.
++     */
++    public final void inheritDefaults(final PresetValue<?> initial) {
++        if (this.defaults == null && initial.defaults != null) {
++            @SuppressWarnings("unchecked") final List<T> typed = (List<T>) initial.defaults;
++            this.defaults = typed;
++        }
++    }
++
++    public final String describe() {
++        return this.explicit != null ? String.valueOf(this.explicit) : DEFAULT_VALUE + " (" + this.get() + ")";
++    }
++
++    @Override
++    public String toString() {
++        return this.describe();
++    }
++
++    @Override
++    public boolean equals(final Object obj) {
++        return obj != null && obj.getClass() == this.getClass() && java.util.Objects.equals(this.explicit, ((PresetValue<?>) obj).explicit)
++            && java.util.Objects.equals(this.defaults, ((PresetValue<?>) obj).defaults);
++    }
++
++    @Override
++    public int hashCode() {
++        return java.util.Objects.hash(this.explicit, this.defaults);
++    }
++
++    protected abstract static class Serializer<V extends PresetValue<T>, T> extends ScalarSerializer<V> {
++
++        private final Function<@Nullable T, V> factory;
++
++        protected Serializer(final Class<V> type, final Function<@Nullable T, V> factory) {
++            super(type);
++            this.factory = factory;
++        }
++
++        protected abstract T parse(Type type, Object obj) throws SerializationException;
++
++        @Override
++        public V deserialize(final Type type, final Object obj) throws SerializationException {
++            if (obj instanceof String string && DEFAULT_VALUE.equalsIgnoreCase(string.trim())) {
++                return this.factory.apply(null);
++            }
++            return this.factory.apply(this.parse(type, obj));
++        }
++
++        @Override
++        protected Object serialize(final V item, final Predicate<Class<?>> typeSupported) {
++            final T explicit = item.explicit;
++            return explicit != null ? explicit : DEFAULT_VALUE;
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/ReloadClass.java b/src/main/java/dev/kodama/config/ReloadClass.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b204adfdb6d94e06fe2c6a2872fab230222081a9
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/ReloadClass.java
+@@ -0,0 +1,17 @@
++package dev.kodama.config;
++
++public enum ReloadClass {
++    IMMEDIATE("immediate"),
++    STAGED("staged"),
++    RESTART_REQUIRED("restart-required");
++
++    private final String label;
++
++    ReloadClass(final String label) {
++        this.label = label;
++    }
++
++    public String label() {
++        return this.label;
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/RestartRequired.java b/src/main/java/dev/kodama/config/RestartRequired.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec981ab5dc8ba0748ad82f036fdcf24cb7dff045
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/RestartRequired.java
+@@ -0,0 +1,17 @@
++package dev.kodama.config;
++
++import java.lang.annotation.Documented;
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Marks an option that is only read at startup. After a reload that changed it, the sender is told that the change
++ * takes effect after a restart.
++ */
++@Documented
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.FIELD)
++public @interface RestartRequired {
++}
+diff --git a/src/main/java/dev/kodama/config/Staged.java b/src/main/java/dev/kodama/config/Staged.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..77b678a8e7d2409fd96f167ef8eecf70721df0d6
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/Staged.java
+@@ -0,0 +1,16 @@
++package dev.kodama.config;
++
++import java.lang.annotation.Documented;
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Marks an option whose new value is applied gradually over several ticks by its feature (through a reload listener).
++ */
++@Documented
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.FIELD)
++public @interface Staged {
++}
+diff --git a/src/main/java/dev/kodama/config/YamlComments.java b/src/main/java/dev/kodama/config/YamlComments.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b0ba9c0136579dc7e2e5ead09baf4cd544d87ef
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/YamlComments.java
+@@ -0,0 +1,51 @@
++package dev.kodama.config;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * Writes the {@code @Comment} texts above the matching keys of a saved YAML file. Only block-style mappings with the
++ * two-space indent used by the Kodama loaders are handled.
++ */
++final class YamlComments {
++
++    private static final Pattern KEY = Pattern.compile("^( *)([A-Za-z0-9_.-]+):(?: .*)?$");
++    private static final int INDENT = 2;
++
++    private YamlComments() {
++    }
++
++    static void inject(final Path file, final Map<String, String> comments) throws IOException {
++        if (comments.isEmpty() || Files.notExists(file)) {
++            return;
++        }
++        final List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
++        final List<String> result = new ArrayList<>(lines.size() + comments.size());
++        final String[] pathAtDepth = new String[64];
++        for (final String line : lines) {
++            final Matcher matcher = KEY.matcher(line);
++            if (matcher.matches()) {
++                final int depth = matcher.group(1).length() / INDENT;
++                final String path = depth == 0 || depth >= pathAtDepth.length ? matcher.group(2) : pathAtDepth[depth - 1] + "." + matcher.group(2);
++                if (depth < pathAtDepth.length) {
++                    pathAtDepth[depth] = path;
++                }
++                final String comment = comments.get(path);
++                if (comment != null) {
++                    for (final String commentLine : comment.split("\n")) {
++                        result.add(matcher.group(1) + "# " + commentLine);
++                    }
++                }
++            }
++            result.add(line);
++        }
++        Files.writeString(file, String.join("\n", result) + "\n", StandardCharsets.UTF_8);
++    }
++}
+diff --git a/src/main/java/dev/kodama/feature/FeatureGuard.java b/src/main/java/dev/kodama/feature/FeatureGuard.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..65a23686db889038fd620ff28f9c1e9828a0b05b
+--- /dev/null
++++ b/src/main/java/dev/kodama/feature/FeatureGuard.java
+@@ -0,0 +1,146 @@
++package dev.kodama.feature;
++
++import com.mojang.logging.LogUtils;
++import dev.kodama.config.KodamaConfigurations;
++import dev.kodama.config.KodamaGlobalConfiguration;
++import java.util.ArrayDeque;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.Supplier;
++import org.slf4j.Logger;
++
++/**
++ * Safety net for Kodama features: when a feature keeps throwing, only that feature is switched off (until the next
++ * {@code /kodama reload}) and callers fall back to the vanilla code path. The server keeps running.
++ * <p>
++ * Exceptions are counted in a sliding window configured by {@code feature-safety} in {@code kodama-global.yml}.
++ */
++public final class FeatureGuard {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++    private static final int LOGGED_STACK_TRACES = 3;
++    private static final int DEFAULT_MAX_EXCEPTIONS = 20;
++    private static final int DEFAULT_WINDOW_SECONDS = 60;
++
++    private static final Map<String, State> STATES = new ConcurrentHashMap<>();
++
++    private static final class State {
++        private final ArrayDeque<Long> failureNanos = new ArrayDeque<>(); // guarded by this
++        private int loggedTraces; // guarded by this
++        private volatile boolean tripped;
++    }
++
++    private FeatureGuard() {
++    }
++
++    public static boolean isTripped(final String featureId) {
++        final State state = STATES.get(featureId);
++        return state != null && state.tripped;
++    }
++
++    /**
++     * Ids of all features that are currently disabled by the guard, sorted.
++     */
++    public static Set<String> trippedFeatures() {
++        final Set<String> tripped = new TreeSet<>();
++        STATES.forEach((id, state) -> {
++            if (state.tripped) {
++                tripped.add(id);
++            }
++        });
++        return tripped;
++    }
++
++    /**
++     * Records an exception thrown by the given feature. Safe to call from any thread.
++     */
++    public static void reportFailure(final String featureId, final Throwable throwable) {
++        final State state = STATES.computeIfAbsent(featureId, id -> new State());
++        final int maxExceptions = maxExceptions();
++        final long windowNanos = windowSeconds() * 1_000_000_000L;
++        final long now = System.nanoTime();
++
++        final boolean logTrace;
++        final boolean trip;
++        final int count;
++        synchronized (state) {
++            logTrace = state.loggedTraces < LOGGED_STACK_TRACES;
++            if (logTrace) {
++                state.loggedTraces++;
++            }
++            state.failureNanos.addLast(now);
++            while (!state.failureNanos.isEmpty() && now - state.failureNanos.peekFirst() > windowNanos) {
++                state.failureNanos.removeFirst();
++            }
++            count = state.failureNanos.size();
++            trip = !state.tripped && count > maxExceptions;
++            if (trip) {
++                state.tripped = true;
++            }
++        }
++
++        if (logTrace) {
++            LOGGER.error("Kodama feature '{}' threw an exception", featureId, throwable);
++        } else {
++            LOGGER.debug("Kodama feature '{}' threw {}: {}", featureId, throwable.getClass().getName(), throwable.getMessage());
++        }
++        if (trip) {
++            LOGGER.warn("Kodama feature '{}' disabled after {} exceptions in {}s; server keeps running", featureId, count, windowSeconds());
++            try {
++                KodamaConfigurations.fireReloadListeners();
++            } catch (final Throwable listenerFailure) { // must never turn a handled feature failure into a new one
++                LOGGER.error("Could not notify the Kodama reload listeners about feature '{}'", featureId, listenerFailure);
++            }
++        }
++    }
++
++    /**
++     * Runs {@code fast}; if it throws, the failure is recorded and {@code vanillaFallback} is used instead. A feature
++     * that was disabled by the guard goes straight to the fallback.
++     */
++    public static <T> T call(final String featureId, final Supplier<T> fast, final Supplier<T> vanillaFallback) {
++        if (isTripped(featureId)) {
++            return vanillaFallback.get();
++        }
++        try {
++            return fast.get();
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            reportFailure(featureId, throwable);
++            return vanillaFallback.get();
++        }
++    }
++
++    /**
++     * Same as {@link #call(String, Supplier, Supplier)} for code without a result.
++     */
++    public static void run(final String featureId, final Runnable fast, final Runnable vanillaFallback) {
++        call(featureId, () -> {
++            fast.run();
++            return null;
++        }, () -> {
++            vanillaFallback.run();
++            return null;
++        });
++    }
++
++    /**
++     * Clears the failure history and re-enables every feature; called by {@code /kodama reload}.
++     */
++    public static void resetAll() {
++        STATES.clear();
++    }
++
++    private static int maxExceptions() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null || config.featureSafety == null ? DEFAULT_MAX_EXCEPTIONS : config.featureSafety.maxExceptions;
++    }
++
++    private static int windowSeconds() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null || config.featureSafety == null ? DEFAULT_WINDOW_SECONDS : config.featureSafety.windowSeconds;
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/configuration/Configurations.java b/src/main/java/io/papermc/paper/configuration/Configurations.java
+index 96142deb42700f888ea08689ab62c27ef2b881fd..d5d794368855d49c38d356d8d88649f9f25f946d 100644
+--- a/src/main/java/io/papermc/paper/configuration/Configurations.java
++++ b/src/main/java/io/papermc/paper/configuration/Configurations.java
+@@ -109,7 +109,7 @@ public abstract class Configurations<G, W> {
+         return this.initializeGlobalConfiguration(creator(this.globalConfigClass, true));
+     }
+ 
+-    private void trySaveFileNode(YamlConfigurationLoader loader, ConfigurationNode node, String filename) throws ConfigurateException {
++    protected void trySaveFileNode(YamlConfigurationLoader loader, ConfigurationNode node, String filename) throws ConfigurateException { // Kodama - Kodama configuration - private -> protected
+         try {
+             loader.save(node);
+         } catch (ConfigurateException ex) {
+@@ -129,7 +129,7 @@ public abstract class Configurations<G, W> {
+         if (Files.notExists(configFile)) {
+             node = CommentedConfigurationNode.root(loader.defaultOptions());
+             node.node(Configuration.VERSION_FIELD).raw(this.globalConfigVersion());
+-            GlobalConfiguration.isFirstStart = true;
++            if (this instanceof PaperConfigurations) GlobalConfiguration.isFirstStart = true; // Kodama - Kodama configuration - only Paper's own first start counts
+         } else {
+             node = loader.load();
+             this.verifyGlobalConfigVersion(node);
+@@ -270,7 +270,7 @@ public abstract class Configurations<G, W> {
+     protected void applyDefaultsAwareWorldConfigTransformations(final ContextMap contextMap, final ConfigurationNode worldNode, final ConfigurationNode defaultsNode) throws ConfigurateException {
+     }
+ 
+-    private UnaryOperator<ConfigurationOptions> applyObjectMapperFactory(final ObjectMapper.Factory factory) {
++    protected UnaryOperator<ConfigurationOptions> applyObjectMapperFactory(final ObjectMapper.Factory factory) { // Kodama - Kodama configuration - private -> protected
+         return options -> options.serializers(builder -> builder
+             .register(this::isConfigType, factory.asTypeSerializer())
+             .registerAnnotatedObjects(factory));
+diff --git a/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java b/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
+index 83a726bcf8b7dce73a361b0d79dbd63a0afc7a12..6d1a567b3e10f3593a88e73f26ea38752b2a526c 100644
+--- a/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
++++ b/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
+@@ -321,7 +321,7 @@ public class PaperConfigurations extends Configurations<GlobalConfiguration, Wor
+         }
+     }
+ 
+-    private static ContextMap createWorldContextMap(ServerLevel level) {
++    public static ContextMap createWorldContextMap(ServerLevel level) { // Kodama - Kodama configuration - private -> public
+         return createWorldContextMap(level.convertable.levelDirectory.path(), level.serverLevelData.getLevelName(), level.dimension().location(), level.spigotConfig, level.registryAccess(), level.getGameRules());
+     }
+ 
+@@ -457,7 +457,7 @@ public class PaperConfigurations extends Configurations<GlobalConfiguration, Wor
+     }
+ 
+     // Symlinks are not correctly checked in createDirectories
+-    static void createDirectoriesSymlinkAware(Path path) throws IOException {
++    public static void createDirectoriesSymlinkAware(Path path) throws IOException { // Kodama - Kodama configuration - package-private -> public
+         if (!Files.isDirectory(path)) {
+             Files.createDirectories(path);
+         }
+diff --git a/src/main/java/io/papermc/paper/configuration/mapping/InnerClassFieldDiscoverer.java b/src/main/java/io/papermc/paper/configuration/mapping/InnerClassFieldDiscoverer.java
+index 8f23276796037d048eb114952891a01a40971b3e..eec7844dd7a63f34cf66bbfeca91994a7e7cca45 100644
+--- a/src/main/java/io/papermc/paper/configuration/mapping/InnerClassFieldDiscoverer.java
++++ b/src/main/java/io/papermc/paper/configuration/mapping/InnerClassFieldDiscoverer.java
+@@ -48,6 +48,18 @@ public final class InnerClassFieldDiscoverer implements FieldDiscoverer<Map<Fiel
+         return new InnerClassFieldDiscoverer(overrides);
+     }
+ 
++    // Kodama start - Kodama configuration
++    public static FieldDiscoverer<?> kodamaWorldConfig(Configurations.ContextMap contextMap) {
++        final Map<Class<?>, Object> overrides = Map.of(
++            dev.kodama.config.KodamaWorldConfiguration.class, new dev.kodama.config.KodamaWorldConfiguration(
++                contextMap.require(Configurations.WORLD_KEY),
++                contextMap.require(Configurations.WORLD_NAME)
++            )
++        );
++        return new InnerClassFieldDiscoverer(overrides);
++    }
++    // Kodama end - Kodama configuration
++
+     public static FieldDiscoverer<?> globalConfig() {
+         return new InnerClassFieldDiscoverer(Collections.emptyMap());
+     }
+diff --git a/src/main/java/io/papermc/paper/configuration/mapping/InnerClassInstanceFactory.java b/src/main/java/io/papermc/paper/configuration/mapping/InnerClassInstanceFactory.java
+index cec678ae24a7d99a46fa672be907f4c28fe4da96..0110bff9a092e393bacee886fd31e4486b7a45f0 100644
+--- a/src/main/java/io/papermc/paper/configuration/mapping/InnerClassInstanceFactory.java
++++ b/src/main/java/io/papermc/paper/configuration/mapping/InnerClassInstanceFactory.java
+@@ -48,6 +48,17 @@ final class InnerClassInstanceFactory implements FieldDiscoverer.MutableInstance
+         } catch (final IllegalAccessException e) {
+             throw new SerializationException(this.targetType.getType(), e);
+         }
++        // Kodama start - Kodama configuration - deserialized preset values only know the explicit value, so carry over the preset defaults declared at field initialization
++        try {
++            for (final Map.Entry<Field, Object> entry : intermediate.entrySet()) {
++                if (entry.getValue() instanceof dev.kodama.config.PresetValue<?> loaded && entry.getKey().get(instance) instanceof dev.kodama.config.PresetValue<?> initial) {
++                    loaded.inheritDefaults(initial);
++                }
++            }
++        } catch (final IllegalAccessException e) {
++            throw new SerializationException(this.targetType.getType(), e);
++        }
++        // Kodama end - Kodama configuration
+         this.fallback.complete(instance, intermediate);
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 3751c2a077bd13bac330b93c6efc2a640a17f4f2..0dd8e3a9d690737dd9ea10ef3062dc263ab43646 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -310,6 +310,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     public final double[] recentTps = new double[ 3 ];
+     // Spigot end
+     public final io.papermc.paper.configuration.PaperConfigurations paperConfigurations; // Paper - add paper configuration files
++    public final dev.kodama.config.KodamaConfigurations kodamaConfigurations; // Kodama - Kodama configuration
+     public static long currentTickLong = 0L; // Paper - track current tick as a long
+     public boolean isIteratingOverLevels = false; // Paper - Throw exception on world create while being ticked
+ 
+@@ -418,6 +419,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         Runtime.getRuntime().addShutdownHook(new org.bukkit.craftbukkit.util.ServerShutdownThread(this));
+         // CraftBukkit end
+         this.paperConfigurations = services.paperConfigurations(); // Paper - add paper configuration files
++        this.kodamaConfigurations = services.kodamaConfigurations(); // Kodama - Kodama configuration
+     }
+ 
+     private void readScoreboard(DimensionDataStorage persistentStateManager) {
+diff --git a/src/main/java/net/minecraft/server/Services.java b/src/main/java/net/minecraft/server/Services.java
+index 33e3815a0c979609d4c7ab83ad91e87ac07a556d..91e86e22bc6c2b2097a42ba7a36c9cfce7dc5081 100644
+--- a/src/main/java/net/minecraft/server/Services.java
++++ b/src/main/java/net/minecraft/server/Services.java
+@@ -12,11 +12,11 @@ import net.minecraft.util.SignatureValidator;
+ 
+ 
+ public record Services(
+-    MinecraftSessionService sessionService, ServicesKeySet servicesKeySet, GameProfileRepository profileRepository, GameProfileCache profileCache, @javax.annotation.Nullable io.papermc.paper.configuration.PaperConfigurations paperConfigurations // Paper - add paper configuration files
++    MinecraftSessionService sessionService, ServicesKeySet servicesKeySet, GameProfileRepository profileRepository, GameProfileCache profileCache, @javax.annotation.Nullable io.papermc.paper.configuration.PaperConfigurations paperConfigurations, @javax.annotation.Nullable dev.kodama.config.KodamaConfigurations kodamaConfigurations // Paper - add paper configuration files // Kodama - Kodama configuration
+ ) {
+     // Paper start - add paper configuration files
+     public Services(MinecraftSessionService sessionService, ServicesKeySet servicesKeySet, GameProfileRepository profileRepository, GameProfileCache profileCache) {
+-        this(sessionService, servicesKeySet, profileRepository, profileCache, null);
++        this(sessionService, servicesKeySet, profileRepository, profileCache, null, null); // Kodama - Kodama configuration
+     }
+ 
+     @Override
+@@ -24,6 +24,11 @@ public record Services(
+         return java.util.Objects.requireNonNull(this.paperConfigurations);
+     }
+     // Paper end - add paper configuration files
++    // Kodama start - Kodama configuration
++    public dev.kodama.config.KodamaConfigurations kodamaConfigurations() {
++        return java.util.Objects.requireNonNull(this.kodamaConfigurations);
++    }
++    // Kodama end - Kodama configuration
+     public static final String USERID_CACHE_FILE = "usercache.json"; // Paper - private -> public
+ 
+     public static Services create(YggdrasilAuthenticationService authenticationService, File rootDirectory, File userCacheFile, joptsimple.OptionSet optionSet) throws Exception { // Paper - add optionset to load paper config files; add userCacheFile parameter
+@@ -34,7 +39,10 @@ public record Services(
+         final java.nio.file.Path legacyConfigPath = ((File) optionSet.valueOf("paper-settings")).toPath();
+         final java.nio.file.Path configDirPath = ((File) optionSet.valueOf("paper-settings-directory")).toPath();
+         io.papermc.paper.configuration.PaperConfigurations paperConfigurations = io.papermc.paper.configuration.PaperConfigurations.setup(legacyConfigPath, configDirPath, rootDirectory.toPath(), (File) optionSet.valueOf("spigot-settings"));
+-        return new Services(minecraftSessionService, authenticationService.getServicesKeySet(), gameProfileRepository, gameProfileCache, paperConfigurations);
++        // Kodama start - Kodama configuration
++        dev.kodama.config.KodamaConfigurations kodamaConfigurations = dev.kodama.config.KodamaConfigurations.setup(configDirPath);
++        return new Services(minecraftSessionService, authenticationService.getServicesKeySet(), gameProfileRepository, gameProfileCache, paperConfigurations, kodamaConfigurations);
++        // Kodama end - Kodama configuration
+         // Paper end - load paper config files from cli options
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index ad967cc2283f902c76e48a59d59cf0dbdacbb5e3..6b0877ffa4a86feed954b5d9c2b26816c70d5c17 100644
+--- a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -222,6 +222,10 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+         this.paperConfigurations.initializeGlobalConfiguration(this.registryAccess());
+         this.paperConfigurations.initializeWorldDefaultsConfiguration(this.registryAccess());
+         // Paper end - initialize global and world-defaults configuration
++        // Kodama start - Kodama configuration
++        this.kodamaConfigurations.initializeGlobalConfiguration(this.registryAccess());
++        this.kodamaConfigurations.initializeWorldDefaultsConfiguration(this.registryAccess());
++        // Kodama end - Kodama configuration
+         // Paper start - fix converting txt to json file; convert old users earlier after PlayerList creation but before file load/save
+         if (this.convertOldUsers()) {
+             this.getProfileCache().save(false); // Paper
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index ca56a0b596976448da6bb2a0e82b3d5cd4133e12..e9aab7539b1af9aa09ff8ed74e8607d0d5b4f2c4 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -697,7 +697,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         // Holder holder = worlddimension.type(); // CraftBukkit - decompile error
+ 
+         // Objects.requireNonNull(minecraftserver); // CraftBukkit - decompile error
+-        super(iworlddataserver, resourcekey, minecraftserver.registryAccess(), worlddimension.type(), minecraftserver::getProfiler, false, flag, i, minecraftserver.getMaxChainedNeighborUpdates(), gen, biomeProvider, env, spigotConfig -> minecraftserver.paperConfigurations.createWorldConfig(io.papermc.paper.configuration.PaperConfigurations.createWorldContextMap(convertable_conversionsession.levelDirectory.path(), iworlddataserver.getLevelName(), resourcekey.location(), spigotConfig, minecraftserver.registryAccess(), iworlddataserver.getGameRules())), executor); // Paper - create paper world configs; Async-Anti-Xray: Pass executor
++        super(iworlddataserver, resourcekey, minecraftserver.registryAccess(), worlddimension.type(), minecraftserver::getProfiler, false, flag, i, minecraftserver.getMaxChainedNeighborUpdates(), gen, biomeProvider, env, spigotConfig -> minecraftserver.paperConfigurations.createWorldConfig(io.papermc.paper.configuration.PaperConfigurations.createWorldContextMap(convertable_conversionsession.levelDirectory.path(), iworlddataserver.getLevelName(), resourcekey.location(), spigotConfig, minecraftserver.registryAccess(), iworlddataserver.getGameRules())), spigotConfig -> minecraftserver.kodamaConfigurations.createWorldConfig(io.papermc.paper.configuration.PaperConfigurations.createWorldContextMap(convertable_conversionsession.levelDirectory.path(), iworlddataserver.getLevelName(), resourcekey.location(), spigotConfig, minecraftserver.registryAccess(), iworlddataserver.getGameRules())), executor); // Paper - create paper world configs; Async-Anti-Xray: Pass executor // Kodama - Kodama configuration
+         this.pvpMode = minecraftserver.isPvpAllowed();
+         this.convertable = convertable_conversionsession;
+         this.uuid = WorldUUID.getUUID(convertable_conversionsession.levelDirectory.path().toFile());
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index 14281a4e72f49dc4eb2ca3da8479c1f81a3a175d..4928a407bacc2d4a092d505fdc37368647b8c18c 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -169,6 +169,12 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         return this.paperConfig;
+     }
+     // Paper end - add paper world config
++    // Kodama start - Kodama configuration
++    private final dev.kodama.config.KodamaWorldConfiguration kodamaConfig;
++    public dev.kodama.config.KodamaWorldConfiguration kodamaConfig() {
++        return this.kodamaConfig;
++    }
++    // Kodama end - Kodama configuration
+ 
+     public final com.destroystokyo.paper.antixray.ChunkPacketBlockController chunkPacketBlockController; // Paper - Anti-Xray
+     public final co.aikar.timings.WorldTimingsHandler timings; // Paper
+@@ -205,9 +211,10 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+ 
+     public abstract ResourceKey<LevelStem> getTypeKey();
+ 
+-    protected Level(WritableLevelData worlddatamutable, ResourceKey<Level> resourcekey, RegistryAccess iregistrycustom, Holder<DimensionType> holder, Supplier<ProfilerFiller> supplier, boolean flag, boolean flag1, long i, int j, org.bukkit.generator.ChunkGenerator gen, org.bukkit.generator.BiomeProvider biomeProvider, org.bukkit.World.Environment env, java.util.function.Function<org.spigotmc.SpigotWorldConfig, io.papermc.paper.configuration.WorldConfiguration> paperWorldConfigCreator, java.util.concurrent.Executor executor) { // Paper - create paper world config; Async-Anti-Xray: Pass executor
++    protected Level(WritableLevelData worlddatamutable, ResourceKey<Level> resourcekey, RegistryAccess iregistrycustom, Holder<DimensionType> holder, Supplier<ProfilerFiller> supplier, boolean flag, boolean flag1, long i, int j, org.bukkit.generator.ChunkGenerator gen, org.bukkit.generator.BiomeProvider biomeProvider, org.bukkit.World.Environment env, java.util.function.Function<org.spigotmc.SpigotWorldConfig, io.papermc.paper.configuration.WorldConfiguration> paperWorldConfigCreator, java.util.function.Function<org.spigotmc.SpigotWorldConfig, dev.kodama.config.KodamaWorldConfiguration> kodamaWorldConfigCreator, java.util.concurrent.Executor executor) { // Paper - create paper world config; Async-Anti-Xray: Pass executor // Kodama - Kodama configuration
+         this.spigotConfig = new org.spigotmc.SpigotWorldConfig(((net.minecraft.world.level.storage.PrimaryLevelData) worlddatamutable).getLevelName()); // Spigot
+         this.paperConfig = paperWorldConfigCreator.apply(this.spigotConfig); // Paper - create paper world config
++        this.kodamaConfig = kodamaWorldConfigCreator.apply(this.spigotConfig); // Kodama - Kodama configuration
+         this.generator = gen;
+         this.world = new CraftWorld((ServerLevel) this, gen, biomeProvider, env);
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 5db08432b6afd3639688830e717f40ceaf599248..705d42103613b1bb1f28b9be77a9712b7906436e 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -1056,6 +1056,7 @@ public final class CraftServer implements Server {
+ 
+         org.spigotmc.SpigotConfig.init((File) this.console.options.valueOf("spigot-settings")); // Spigot
+         this.console.paperConfigurations.reloadConfigs(this.console);
++        this.console.kodamaConfigurations.reloadQuietly(this.console); // Kodama - Kodama configuration
+         for (ServerLevel world : this.console.getAllLevels()) {
+             // world.serverLevelData.setDifficulty(config.difficulty); // Paper - per level difficulty
+             world.setSpawnSettings(world.serverLevelData.getDifficulty() != Difficulty.PEACEFUL && config.spawnMonsters, config.spawnAnimals); // Paper - per level difficulty (from MinecraftServer#setDifficulty(ServerLevel, Difficulty, boolean))
