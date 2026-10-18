@@ -1,0 +1,542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 17:37:35 +0900
+Subject: [PATCH] Kodama: chunk packet cache
+
+License: GPL-3.0
+
+PlayerChunkSender#sendChunk reuses one ClientboundLevelChunkWithLightPacket
+per chunk for every player it is sent to instead of building it again.
+The packet still goes through the normal netty encoder and compressor.
+
+An entry is valid for the modification counter of the LevelChunk it was
+built at. The counter is raised when a block, block entity or anything
+else that marks the chunk unsaved changes and on every light update that
+Starlight reports; the entry is also dropped when the chunk unloads, when
+it is older than max-age-seconds, and by least recently used eviction once
+the estimated size exceeds max-mb. Packets that anti-xray modifies for a
+player are built as before and never cached.
+
+The cache is off while ProtocolLib or PacketEvents is enabled, because a
+listener could change a packet that is shared by several players, unless
+ignore-packet-plugins is set. A failure disables only the cache through
+FeatureGuard and the packet is built normally.
+
+Controlled by chunk-loading.packet-cache.*; /kodama status shows whether
+the cache is active (and why not), hits, misses, invalidations, entries
+and size.
+
+diff --git a/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java b/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
+index 55523dbc4f6dc77a1ecbad24982596de6bcc77c6..f40bf05de2ee32e6e74c1de6e0a007cb83656423 100644
+--- a/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
++++ b/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
+@@ -24,6 +24,7 @@ public final class ChunkLoadingStatus {
+ 
+     public static void register() {
+         dev.kodama.chunk.adaptive.AdaptiveStatus.register();
++        dev.kodama.chunk.packetcache.PacketCacheStatus.register();
+         StatusCommand.register(new StatusContributor() {
+             @Override
+             public String label() {
+diff --git a/src/main/java/dev/kodama/chunk/packetcache/ChunkPacketCache.java b/src/main/java/dev/kodama/chunk/packetcache/ChunkPacketCache.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7a0f0d89a400e8ae84e684a29829d27e1639e89
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/packetcache/ChunkPacketCache.java
+@@ -0,0 +1,284 @@
++package dev.kodama.chunk.packetcache;
++
++import dev.kodama.feature.FeatureGuard;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.concurrent.atomic.LongAdder;
++import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.chunk.LevelChunk;
++import org.bukkit.Bukkit;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.plugin.PluginManager;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Keeps the {@link ClientboundLevelChunkWithLightPacket} of a chunk and hands the same object to every player the chunk
++ * is sent to, instead of building the packet again for each of them. The packet still goes through the normal netty
++ * encoder and compressor.
++ * <p>
++ * An entry is valid while the modification counter of the chunk ({@code LevelChunk#kodamaModCount}, raised on every change
++ * that marks the chunk unsaved and on every light update) equals the value it was built at, and while it is younger than
++ * {@code max-age-seconds}. The packet is never changed after it was built, which is why anti-xray packets (different for
++ * every player) are not cached, and why the cache is off while a plugin that rewrites packets is enabled.
++ * <p>
++ * Total size is bounded by {@code max-mb} with least-recently-used eviction. The entries are dropped when their chunk
++ * unloads.
++ */
++public final class ChunkPacketCache {
++
++    private static final long PLUGIN_POLL_TICKS = 20L;
++    private static final long SWEEP_INTERVAL_NANOS = 5_000_000_000L;
++    private static final long PACKET_OVERHEAD_BYTES = 512L;
++    private static final long LIGHT_SECTION_BYTES = 2048L;
++    private static final String[] PACKET_PLUGINS = {"ProtocolLib", "packetevents"};
++
++    private static final class Entry {
++        final LevelChunk chunk;
++        final int modCount;
++        final ClientboundLevelChunkWithLightPacket packet;
++        final long bytes;
++        final long builtNanos;
++
++        Entry(final LevelChunk chunk, final int modCount, final ClientboundLevelChunkWithLightPacket packet, final long bytes, final long builtNanos) {
++            this.chunk = chunk;
++            this.modCount = modCount;
++            this.packet = packet;
++            this.bytes = bytes;
++            this.builtNanos = builtNanos;
++        }
++    }
++
++    private static final Object LOCK = new Object();
++    private static final LinkedHashMap<LevelChunk, Entry> ENTRIES = new LinkedHashMap<>(256, 0.75F, true); // access order: eldest = least recently used, guarded by LOCK
++    private static long totalBytes; // guarded by LOCK
++    private static long lastSweepNanos; // guarded by LOCK
++    private static volatile int entryCount;
++    private static volatile long totalBytesView;
++
++    private static final LongAdder HITS = new LongAdder();
++    private static final LongAdder MISSES = new LongAdder();
++    private static final LongAdder INVALIDATIONS = new LongAdder();
++    private static final LongAdder EVICTIONS = new LongAdder();
++    private static final LongAdder BYPASSED = new LongAdder();
++
++    private static long lastPluginPollTick = Long.MIN_VALUE;
++    private static volatile @Nullable String pluginBlock; // name of the enabled plugin that switches the cache off
++
++    private ChunkPacketCache() {
++    }
++
++    /**
++     * The packet to send for the chunk: a cached one when it is valid, else a new one (which is cached unless the packet
++     * is player specific). Falls back to building the packet when the feature is off or throws.
++     *
++     * @param shouldModify the anti-xray decision for this player and chunk
++     */
++    public static ClientboundLevelChunkWithLightPacket packetFor(final ServerLevel world, final LevelChunk chunk, final boolean shouldModify) {
++        if (!usable()) {
++            return build(world, chunk, shouldModify);
++        }
++        if (shouldModify) {
++            BYPASSED.increment();
++            return build(world, chunk, true);
++        }
++        return FeatureGuard.call(PacketCacheSettings.FEATURE_ID, () -> cached(world, chunk), () -> build(world, chunk, false));
++    }
++
++    private static ClientboundLevelChunkWithLightPacket build(final ServerLevel world, final LevelChunk chunk, final boolean modifyBlocks) {
++        return new ClientboundLevelChunkWithLightPacket(chunk, world.getLightEngine(), null, null, modifyBlocks);
++    }
++
++    private static ClientboundLevelChunkWithLightPacket cached(final ServerLevel world, final LevelChunk chunk) {
++        // read before the packet is built: a change that happens meanwhile makes the entry stale at once
++        final int modCount = chunk.kodamaModCount;
++        final long now = System.nanoTime();
++        final long maxAge = PacketCacheSettings.maxAgeNanos();
++        synchronized (LOCK) {
++            final Entry entry = ENTRIES.get(chunk);
++            if (entry != null) {
++                if (entry.modCount == modCount && now - entry.builtNanos <= maxAge) {
++                    HITS.increment();
++                    return entry.packet;
++                }
++                remove(entry);
++                INVALIDATIONS.increment();
++            }
++            sweepIfDue(now, maxAge);
++        }
++
++        MISSES.increment();
++        final ClientboundLevelChunkWithLightPacket packet = build(world, chunk, false);
++        final long bytes = estimateBytes(packet);
++        final long maxBytes = PacketCacheSettings.maxBytes();
++        if (bytes <= maxBytes) {
++            synchronized (LOCK) {
++                final Entry previous = ENTRIES.put(chunk, new Entry(chunk, modCount, packet, bytes, now));
++                if (previous != null) {
++                    totalBytes -= previous.bytes;
++                }
++                totalBytes += bytes;
++                evict(maxBytes);
++                publishSize();
++            }
++        }
++        return packet;
++    }
++
++    private static long estimateBytes(final ClientboundLevelChunkWithLightPacket packet) {
++        // the heightmap arrays are shared with the chunk and not counted
++        return PACKET_OVERHEAD_BYTES + packet.getChunkData().getReadBuffer().readableBytes()
++            + (packet.getLightData().getSkyUpdates().size() + packet.getLightData().getBlockUpdates().size()) * LIGHT_SECTION_BYTES;
++    }
++
++    private static void remove(final Entry entry) { // holds LOCK
++        if (ENTRIES.remove(entry.chunk) == entry) {
++            totalBytes -= entry.bytes;
++        }
++        publishSize();
++    }
++
++    private static void evict(final long maxBytes) { // holds LOCK
++        if (totalBytes <= maxBytes) {
++            return;
++        }
++        final Iterator<Entry> iterator = ENTRIES.values().iterator();
++        while (totalBytes > maxBytes && iterator.hasNext()) {
++            final Entry eldest = iterator.next();
++            iterator.remove();
++            totalBytes -= eldest.bytes;
++            EVICTIONS.increment();
++        }
++    }
++
++    private static void sweepIfDue(final long now, final long maxAge) { // holds LOCK
++        if (now - lastSweepNanos < SWEEP_INTERVAL_NANOS) {
++            return;
++        }
++        lastSweepNanos = now;
++        final Iterator<Entry> iterator = ENTRIES.values().iterator();
++        while (iterator.hasNext()) {
++            final Entry entry = iterator.next();
++            if (now - entry.builtNanos > maxAge) {
++                iterator.remove();
++                totalBytes -= entry.bytes;
++                INVALIDATIONS.increment();
++            }
++        }
++        publishSize();
++    }
++
++    private static void publishSize() { // holds LOCK
++        entryCount = ENTRIES.size();
++        totalBytesView = totalBytes;
++    }
++
++    /**
++     * Forgets the packet of a chunk that unloads.
++     */
++    public static void drop(final LevelChunk chunk) {
++        if (entryCount == 0) {
++            return;
++        }
++        synchronized (LOCK) {
++            final Entry entry = ENTRIES.remove(chunk);
++            if (entry != null) {
++                totalBytes -= entry.bytes;
++                publishSize();
++            }
++        }
++    }
++
++    public static void clear() {
++        synchronized (LOCK) {
++            ENTRIES.clear();
++            totalBytes = 0L;
++            publishSize();
++        }
++    }
++
++    // activation
++
++    /**
++     * Whether the cache may be used right now: switched on, not tripped, and no packet rewriting plugin is enabled.
++     */
++    private static boolean usable() {
++        final boolean usable = PacketCacheSettings.configuredEnabled() && !PacketCacheSettings.tripped() && pluginBlock() == null;
++        if (!usable && entryCount != 0) {
++            clear();
++        }
++        return usable;
++    }
++
++    private static @Nullable String pluginBlock() {
++        if (PacketCacheSettings.ignorePacketPlugins()) {
++            return null;
++        }
++        final long tick = MinecraftServer.currentTickLong;
++        if (lastPluginPollTick == Long.MIN_VALUE || tick - lastPluginPollTick >= PLUGIN_POLL_TICKS || tick < lastPluginPollTick) {
++            lastPluginPollTick = tick;
++            pluginBlock = findPacketPlugin();
++        }
++        return pluginBlock;
++    }
++
++    private static @Nullable String findPacketPlugin() {
++        try {
++            final PluginManager manager = Bukkit.getServer() == null ? null : Bukkit.getPluginManager();
++            if (manager == null) {
++                return null;
++            }
++            for (final String name : PACKET_PLUGINS) {
++                final Plugin plugin = manager.getPlugin(name);
++                if (plugin != null && plugin.isEnabled()) {
++                    return plugin.getName();
++                }
++            }
++        } catch (final RuntimeException ignored) {
++            // the plugin manager is not ready, treat as no plugin
++        }
++        return null;
++    }
++
++    // status
++
++    /**
++     * Why the cache is not in use, or {@code null} when it is active.
++     */
++    public static @Nullable String inactiveReason() {
++        if (!PacketCacheSettings.configuredEnabled()) {
++            return "disabled in the configuration";
++        }
++        if (PacketCacheSettings.tripped()) {
++            return "disabled after repeated errors";
++        }
++        if (!PacketCacheSettings.ignorePacketPlugins()) {
++            lastPluginPollTick = Long.MIN_VALUE; // look again now
++            final String plugin = pluginBlock();
++            if (plugin != null) {
++                return plugin + " is enabled (set ignore-packet-plugins to keep the cache on)";
++            }
++        }
++        return null;
++    }
++
++    public static String describe() {
++        final String reason = inactiveReason();
++        final long hits = HITS.sum();
++        final long misses = MISSES.sum();
++        final long requests = hits + misses;
++        final List<String> parts = new ArrayList<>();
++        parts.add(reason == null ? "active" : "inactive: " + reason);
++        parts.add(String.format(Locale.ROOT, "%d hits, %d misses (%.0f%% hit rate)", hits, misses, requests == 0L ? 0.0 : hits * 100.0 / requests));
++        parts.add(INVALIDATIONS.sum() + " invalidations");
++        parts.add(EVICTIONS.sum() + " evictions");
++        parts.add(BYPASSED.sum() + " anti-xray bypasses");
++        parts.add(String.format(Locale.ROOT, "%d entries, %.1f MB of %d MB", entryCount, totalBytesView / (1024.0 * 1024.0),
++            PacketCacheSettings.maxBytes() >> 20));
++        return String.join(", ", parts);
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/packetcache/PacketCacheSettings.java b/src/main/java/dev/kodama/chunk/packetcache/PacketCacheSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9829e770c24933b2446ebe96e71748654e86ab90
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/packetcache/PacketCacheSettings.java
+@@ -0,0 +1,47 @@
++package dev.kodama.chunk.packetcache;
++
++import dev.kodama.chunk.ChunkLoadingSettings;
++import dev.kodama.config.KodamaGlobalConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Read-only view of {@code chunk-loading.packet-cache} with the master switch and the {@link FeatureGuard} state already
++ * applied. Every call reads the live configuration.
++ */
++final class PacketCacheSettings {
++
++    static final String FEATURE_ID = "chunk-packet-cache";
++
++    private PacketCacheSettings() {
++    }
++
++    private static KodamaGlobalConfiguration.ChunkLoading.@Nullable PacketCache section() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null || config.chunkLoading == null ? null : config.chunkLoading.packetCache;
++    }
++
++    static boolean configuredEnabled() {
++        final KodamaGlobalConfiguration.ChunkLoading.PacketCache section = section();
++        return ChunkLoadingSettings.masterEnabled() && section != null && section.enabled.isTrue();
++    }
++
++    static boolean tripped() {
++        return FeatureGuard.isTripped(FEATURE_ID);
++    }
++
++    static long maxBytes() {
++        final KodamaGlobalConfiguration.ChunkLoading.PacketCache section = section();
++        return (section == null ? 256L : Math.max(1L, section.maxMb)) * 1024L * 1024L;
++    }
++
++    static long maxAgeNanos() {
++        final KodamaGlobalConfiguration.ChunkLoading.PacketCache section = section();
++        return (section == null ? 300L : Math.max(1L, section.maxAgeSeconds)) * 1_000_000_000L;
++    }
++
++    static boolean ignorePacketPlugins() {
++        final KodamaGlobalConfiguration.ChunkLoading.PacketCache section = section();
++        return section != null && section.ignorePacketPlugins;
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/packetcache/PacketCacheStatus.java b/src/main/java/dev/kodama/chunk/packetcache/PacketCacheStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..281f169f6411b84776a3bcd8806d9848ea4b9f6d
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/packetcache/PacketCacheStatus.java
+@@ -0,0 +1,31 @@
++package dev.kodama.chunk.packetcache;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import net.kyori.adventure.text.Component;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++
++/**
++ * The {@code /kodama status} line of the chunk packet cache.
++ */
++public final class PacketCacheStatus {
++
++    private PacketCacheStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Chunk packet cache";
++            }
++
++            @Override
++            public Component describe() {
++                return text(ChunkPacketCache.describe(), GRAY);
++            }
++        });
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index eb1cce811abc3d435795bc92d7bc6758a901ffc7..b5d302024fe6983c00d6815adf3b6eacccd14a4f 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -147,6 +147,26 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+             @Constraints.Min(0)
+             public int minPerPlayer = 20;
+         }
++
++        @Comment("Reuses the chunk packet of a chunk for every player it is sent to instead of building it again.")
++        public PacketCache packetCache;
++
++        public class PacketCache extends ConfigurationPart {
++            @Comment("Enables the chunk packet cache. Packets of players that get anti-xray modified chunks are never cached.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("Upper limit of the memory held by cached packets, in megabytes. The least recently used packets are dropped first.")
++            @Constraints.Min(1)
++            public int maxMb = 256;
++
++            @Comment("Seconds after which a cached packet is built again, even if the chunk did not change.")
++            @Constraints.Min(1)
++            public int maxAgeSeconds = 300;
++
++            @Comment("The cache is switched off while ProtocolLib or PacketEvents is enabled, because their listeners may change a packet that is shared by several players.\n"
++                + "Set this to true to keep the cache on anyway, only do that when no listener changes chunk packets.")
++            public boolean ignorePacketPlugins = false;
++        }
+     }
+ 
+     @Comment("Network and packet optimizations.")
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 657f60456bc8bc3ae0a24763de2ec1e247648680..470db79de11c6c0d22fa9d4dd62fdb9b102a524d 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -786,6 +786,12 @@ public class ServerChunkCache extends ChunkSource {
+     @Override
+     public void onLightUpdate(LightLayer type, SectionPos pos) {
+         this.mainThreadProcessor.execute(() -> {
++            // Kodama start - chunk-packet-cache
++            final LevelChunk kodamaChunk = this.getChunkAtIfLoadedMainThread(pos.x(), pos.z());
++            if (kodamaChunk != null) {
++                kodamaChunk.kodamaModCount++;
++            }
++            // Kodama end - chunk-packet-cache
+             ChunkHolder playerchunk = this.getVisibleChunkIfPresent(pos.chunk().toLong());
+ 
+             if (playerchunk != null) {
+diff --git a/src/main/java/net/minecraft/server/network/PlayerChunkSender.java b/src/main/java/net/minecraft/server/network/PlayerChunkSender.java
+index 442bb60eb35002e54dcd6a893aca4a4584a8e017..3ed05b45a0acd2ca375b8c039f06dde815b0b8d3 100644
+--- a/src/main/java/net/minecraft/server/network/PlayerChunkSender.java
++++ b/src/main/java/net/minecraft/server/network/PlayerChunkSender.java
+@@ -89,7 +89,7 @@ public class PlayerChunkSender {
+         handler.player.serverLevel().chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.getPos().toLong()).addPlayer(handler.player);
+         // Paper start - Anti-Xray
+         final boolean shouldModify = world.chunkPacketBlockController.shouldModify(handler.player, chunk);
+-        handler.send(new ClientboundLevelChunkWithLightPacket(chunk, world.getLightEngine(), null, null, shouldModify));
++        handler.send(dev.kodama.chunk.packetcache.ChunkPacketCache.packetFor(world, chunk, shouldModify)); // Kodama - chunk-packet-cache
+         // Paper end - Anti-Xray
+         // Paper start - PlayerChunkLoadEvent
+         if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+diff --git a/src/main/java/net/minecraft/world/level/chunk/ChunkAccess.java b/src/main/java/net/minecraft/world/level/chunk/ChunkAccess.java
+index 1ac1af72a71bbf402f0d1633a4b8c9a408917d73..a3ac23afd1187db3ea97dcda33db0316132ad15d 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/ChunkAccess.java
++++ b/src/main/java/net/minecraft/world/level/chunk/ChunkAccess.java
+@@ -64,6 +64,12 @@ public abstract class ChunkAccess implements BlockGetter, BiomeManager.NoiseBiom
+     private static final LongSet EMPTY_REFERENCE_SET = new LongOpenHashSet();
+     protected final ShortList[] postProcessing;
+     protected volatile boolean unsaved;
++    // Kodama start - chunk-packet-cache
++    /**
++     * Raised on every change that a player could see in the chunk packet; a cached packet is only valid for the value it was built at.
++     */
++    public volatile int kodamaModCount;
++    // Kodama end - chunk-packet-cache
+     private volatile boolean isLightCorrect;
+     protected final ChunkPos chunkPos; public final long coordinateKey; public final long nearbyPlayersCoordinateKey; public final int locX; public final int locZ; // Paper - cache coordinate key // SparklyPaper - cache coordinate key used for nearby players
+     private long inhabitedTime;
+@@ -323,6 +329,7 @@ public abstract class ChunkAccess implements BlockGetter, BiomeManager.NoiseBiom
+     }
+ 
+     public void setUnsaved(boolean needsSaving) {
++        if (needsSaving) this.kodamaModCount++; // Kodama - chunk-packet-cache
+         this.unsaved = needsSaving;
+         if (!needsSaving) this.persistentDataContainer.dirty(false); // CraftBukkit - SPIGOT-6814: chunk was saved, pdc is no longer dirty
+     }
+diff --git a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+index 2b0cea0be37c53a2418ea3625a50896e8e98de42..fae6b0290b8b70f52770cf0f579928e3477175bf 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -506,6 +506,7 @@ public class LevelChunk extends ChunkAccess {
+                     }
+ 
+                     this.unsaved = true;
++                    this.kodamaModCount++; // Kodama - chunk-packet-cache
+                     return iblockdata1;
+                 }
+             }
+@@ -610,6 +611,7 @@ public class LevelChunk extends ChunkAccess {
+             blockEntity.setLevel(this.level);
+             blockEntity.clearRemoved();
+             BlockEntity tileentity1 = (BlockEntity) this.blockEntities.put(blockposition.immutable(), blockEntity);
++            this.kodamaModCount++; // Kodama - chunk-packet-cache
+ 
+             if (tileentity1 != null && tileentity1 != blockEntity) {
+                 tileentity1.setRemoved();
+@@ -656,6 +658,7 @@ public class LevelChunk extends ChunkAccess {
+     public void removeBlockEntity(BlockPos pos) {
+         if (this.isInLevel()) {
+             BlockEntity tileentity = (BlockEntity) this.blockEntities.remove(pos);
++            this.kodamaModCount++; // Kodama - chunk-packet-cache
+ 
+             // CraftBukkit start - SPIGOT-5561: Also remove from pending map
+             if (!this.pendingBlockEntities.isEmpty()) {
+@@ -849,6 +852,7 @@ public class LevelChunk extends ChunkAccess {
+         // note: saving can be prevented, but not forced if no saving is actually required
+         this.mustNotSave = !unloadEvent.isSaveChunk();
+         this.level.getChunkSource().removeLoadedChunk(this); // Paper
++        dev.kodama.chunk.packetcache.ChunkPacketCache.drop(this); // Kodama - chunk-packet-cache
+         // Paper start - neighbour cache
+         int chunkX = this.chunkPos.x;
+         int chunkZ = this.chunkPos.z;
