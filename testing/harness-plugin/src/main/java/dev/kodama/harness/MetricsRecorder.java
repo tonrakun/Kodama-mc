@@ -1,6 +1,7 @@
 package dev.kodama.harness;
 
 import com.destroystokyo.paper.event.server.ServerTickEndEvent;
+import com.destroystokyo.paper.event.server.ServerTickStartEvent;
 import com.sun.management.GarbageCollectionNotificationInfo;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
@@ -71,6 +72,7 @@ final class MetricsRecorder implements Listener {
     private final Map<String, long[]> despawnsByType = new LinkedHashMap<>();
 
     private volatile boolean recording;
+    private SlowTickSampler sampler;
 
     MetricsRecorder(JavaPlugin plugin, Path outDir, int warmupSeconds, int durationSeconds, boolean autostop) {
         this.plugin = plugin;
@@ -98,7 +100,17 @@ final class MetricsRecorder implements Listener {
     }
 
     @EventHandler
+    public void onTickStart(ServerTickStartEvent e) {
+        if (sampler != null) {
+            sampler.tickStarted();
+        }
+    }
+
+    @EventHandler
     public void onTickEnd(ServerTickEndEvent e) {
+        if (sampler != null) {
+            sampler.tickEnded();
+        }
         long now = System.nanoTime();
         if (phase == Phase.WARMUP) {
             if (now - phaseStartNanos >= warmupSeconds * 1_000_000_000L) {
@@ -152,6 +164,8 @@ final class MetricsRecorder implements Listener {
         nextHeapSampleNanos = windowStartNanos;
         allocStart = threadAllocated();
         registerGcListeners();
+        sampler = new SlowTickSampler(Thread.currentThread(), 100);
+        sampler.start();
         recording = true;
         plugin.getLogger().info("Metrics: recording started"
                 + (durationSeconds > 0 ? " (" + durationSeconds + "s)" : " (until stopped)"));
@@ -218,6 +232,9 @@ final class MetricsRecorder implements Listener {
         recording = false;
         HandlerList.unregisterAll(this);
         gcUnregister.forEach(Runnable::run);
+        if (sampler != null) {
+            sampler.stop();
+        }
         if (!wasRecording) {
             plugin.getLogger().warning("Metrics: stopped before the recording window started; nothing written");
             return;
@@ -326,6 +343,7 @@ final class MetricsRecorder implements Listener {
         out.put("players", Bukkit.getOnlinePlayers().size());
         out.put("drops", drops);
         out.put("mobs", mobs);
+        out.put("slowTickStacks", sampler == null ? List.of() : sampler.top(15));
         return out;
     }
 }
