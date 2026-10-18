@@ -12,3 +12,6 @@ plugins {
 rootProject.name = "kodama"
 
 include("kodama-api", "kodama-server")
+
+include("kodama-harness")
+project(":kodama-harness").projectDir = file("testing/harness-plugin")
