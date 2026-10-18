@@ -244,6 +244,8 @@ final class MetricsRecorder implements Listener {
         mspt.put("p95", Stats.percentile(sorted, 95));
         mspt.put("p99", Stats.percentile(sorted, 99));
         mspt.put("max", Stats.max(ticks));
+        mspt.put("over50", Arrays.stream(ticks).filter(t -> t > 50).count());
+        mspt.put("over100", Arrays.stream(ticks).filter(t -> t > 100).count());
 
         Map<String, Object> byCollector = new LinkedHashMap<>();
         double[] pauses;
