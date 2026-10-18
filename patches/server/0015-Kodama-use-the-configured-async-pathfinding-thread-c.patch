@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 16:38:24 +0900
+Subject: [PATCH] Kodama: use the configured async pathfinding thread count
+
+License: GPL-3.0
+
+Leaf's executor has a core size of 1 with an unbounded queue, so it never
+used more than one thread whatever max-threads was set to.
+
+diff --git a/src/main/java/org/dreeam/leaf/async/path/AsyncPathProcessor.java b/src/main/java/org/dreeam/leaf/async/path/AsyncPathProcessor.java
+index a89e4b0186c7af1bf0e4109c44ef5f345b781204..cb17a94971d42e61a7e5c655bd0bcf0281f0d933 100644
+--- a/src/main/java/org/dreeam/leaf/async/path/AsyncPathProcessor.java
++++ b/src/main/java/org/dreeam/leaf/async/path/AsyncPathProcessor.java
+@@ -24,16 +24,25 @@ public class AsyncPathProcessor {
+     }
+     // Kodama end
+ 
+-    private static final Executor pathProcessingExecutor = new ThreadPoolExecutor(
+-            1,
+-            maxThreads, // Kodama
+-            dev.kodama.async.AsyncSettings.pathfindingKeepaliveSeconds(), TimeUnit.SECONDS, // Kodama
+-            new LinkedBlockingQueue<>(),
+-            new ThreadFactoryBuilder()
+-                    .setNameFormat("petal-async-pathfinding-thread-%d")
+-                    .setPriority(Thread.NORM_PRIORITY - 2)
+-                    .build()
+-    );
++    private static final Executor pathProcessingExecutor = createExecutor(); // Kodama - use the configured thread count
++
++    // Kodama start - use the configured thread count
++    // With an unbounded queue a ThreadPoolExecutor never grows past its core size, so the core size has to be the limit.
++    private static ThreadPoolExecutor createExecutor() {
++        final ThreadPoolExecutor executor = new ThreadPoolExecutor(
++                maxThreads,
++                maxThreads,
++                dev.kodama.async.AsyncSettings.pathfindingKeepaliveSeconds(), TimeUnit.SECONDS,
++                new LinkedBlockingQueue<>(),
++                new ThreadFactoryBuilder()
++                        .setNameFormat("petal-async-pathfinding-thread-%d")
++                        .setPriority(Thread.NORM_PRIORITY - 2)
++                        .build()
++        );
++        executor.allowCoreThreadTimeOut(true);
++        return executor;
++    }
++    // Kodama end - use the configured thread count
+ 
+     protected static CompletableFuture<Void> queue(@NotNull AsyncPath path) {
+         return CompletableFuture.runAsync(path::process, pathProcessingExecutor);
