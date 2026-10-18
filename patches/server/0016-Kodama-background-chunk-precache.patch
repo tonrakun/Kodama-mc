@@ -1,0 +1,1618 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 16:58:48 +0900
+Subject: [PATCH] Kodama: background chunk precache
+
+License: GPL-3.0
+
+Generates chunks that do not exist on disk yet in the background at the
+lowest chunk system priority and lets them unload (and be saved) right
+away. Work comes from rings around the world spawn, hot cells of a decaying
+player heat map and a cone ahead of each moving player, explorers first,
+distributed round robin. It stops on high MSPT, while players wait for
+chunks, at the configured radius, world border or region folder size, and
+persists the finished rings and the heat map in kodama-precache.dat.
+Controlled by precache.* and /kodama precache pause|resume|status; failures
+disable only this feature through FeatureGuard.
+
+diff --git a/src/main/java/dev/kodama/chunk/precache/Heatmap.java b/src/main/java/dev/kodama/chunk/precache/Heatmap.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1d91c497c15b2cf55986d6bce18cc0bbfc42199
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/Heatmap.java
+@@ -0,0 +1,82 @@
++package dev.kodama.chunk.precache;
++
++import io.papermc.paper.util.CoordinateUtils;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.function.Predicate;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Where players go: a coarse grid of region sized cells (32x32 chunks) with a decaying heat value. Each cell also keeps
++ * the progress of the pre-generation around its center. Main thread only.
++ */
++final class Heatmap {
++
++    static final int CELL_SHIFT = 5;
++    static final int CELL_CHUNKS = 1 << CELL_SHIFT;
++    /**
++     * Ring around the cell center that covers the whole cell; a cell at this ring is finished.
++     */
++    static final int DONE_RING = CELL_CHUNKS / 2;
++    private static final float MAX_HEAT = 1000.0F;
++    private static final float FORGET_BELOW = 0.1F;
++
++    static final class Cell {
++        final int cellX;
++        final int cellZ;
++        float heat;
++        int ring = -1;
++
++        Cell(final int cellX, final int cellZ) {
++            this.cellX = cellX;
++            this.cellZ = cellZ;
++        }
++
++        int centerChunkX() {
++            return (this.cellX << CELL_SHIFT) + CELL_CHUNKS / 2;
++        }
++
++        int centerChunkZ() {
++            return (this.cellZ << CELL_SHIFT) + CELL_CHUNKS / 2;
++        }
++    }
++
++    private final Long2ObjectOpenHashMap<Cell> cells = new Long2ObjectOpenHashMap<>();
++
++    int size() {
++        return this.cells.size();
++    }
++
++    @Nullable Cell cell(final int cellX, final int cellZ) {
++        return this.cells.get(CoordinateUtils.getChunkKey(cellX, cellZ));
++    }
++
++    Cell cellOrCreate(final int cellX, final int cellZ) {
++        return this.cells.computeIfAbsent(CoordinateUtils.getChunkKey(cellX, cellZ), key -> new Cell(cellX, cellZ));
++    }
++
++    void addHeat(final int chunkX, final int chunkZ, final float amount) {
++        final Cell cell = this.cellOrCreate(chunkX >> CELL_SHIFT, chunkZ >> CELL_SHIFT);
++        cell.heat = Math.min(MAX_HEAT, cell.heat + amount);
++    }
++
++    void decay(final float factor) {
++        this.cells.values().removeIf(cell -> {
++            cell.heat *= factor;
++            return cell.heat < FORGET_BELOW;
++        });
++    }
++
++    @Nullable Cell hottest(final Predicate<Cell> accept) {
++        Cell best = null;
++        for (final Cell cell : this.cells.values()) {
++            if (accept.test(cell) && (best == null || cell.heat > best.heat)) {
++                best = cell;
++            }
++        }
++        return best;
++    }
++
++    Iterable<Cell> cells() {
++        return this.cells.values();
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java b/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f238e437539b15b15bec1b222d8adcbabe380d5
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java
+@@ -0,0 +1,219 @@
++package dev.kodama.chunk.precache;
++
++import com.mojang.logging.LogUtils;
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.util.CoordinateUtils;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.slf4j.Logger;
++
++/**
++ * Entry point of the background chunk pre-generation (section {@code precache} of the global config). Called from the
++ * main thread once per tick; the real work is split between {@link WorldPrecache} instances, one per selected world.
++ */
++public final class PrecacheManager {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++    // the player's own chunk work wins: pre-generation waits while any player has more than this many chunks queued
++    private static final int PLAYER_BUSY_THRESHOLD = 8;
++    private static final int MSPT_WINDOW_TICKS = 20;
++
++    private static final Map<ServerLevel, WorldPrecache> WORLDS = new ConcurrentHashMap<>();
++    private static volatile boolean paused;
++    private static volatile boolean stopped;
++    private static volatile double mspt;
++    private static volatile int concurrentLimit;
++    private static @Nullable ExecutorService io;
++
++    private PrecacheManager() {
++    }
++
++    private static synchronized ExecutorService io() {
++        if (io == null) {
++            io = Executors.newSingleThreadExecutor(runnable -> {
++                final Thread thread = new Thread(runnable, "Kodama Precache IO");
++                thread.setDaemon(true);
++                thread.setPriority(Thread.MIN_PRIORITY);
++                return thread;
++            });
++        }
++        return io;
++    }
++
++    /**
++     * Called at the end of every server tick, on the main thread.
++     */
++    public static void tick(final MinecraftServer server) {
++        if (stopped) {
++            return;
++        }
++        try {
++            doTick(server);
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(PrecacheSettings.FEATURE_ID, throwable);
++        }
++    }
++
++    private static void doTick(final MinecraftServer server) {
++        if (!PrecacheSettings.enabled()) {
++            for (final WorldPrecache world : WORLDS.values()) {
++                world.markDisabled();
++            }
++            return;
++        }
++
++        final List<ServerLevel> levels = new ArrayList<>();
++        for (final ServerLevel level : server.getAllLevels()) {
++            levels.add(level);
++            if (PrecacheSettings.worldSelected(server, level)) {
++                WORLDS.computeIfAbsent(level, key -> new WorldPrecache(server, key, io()));
++            }
++        }
++        WORLDS.entrySet().removeIf(entry -> {
++            final boolean keep = levels.contains(entry.getKey()) && PrecacheSettings.worldSelected(server, entry.getKey());
++            if (!keep) {
++                entry.getValue().saveNow();
++            }
++            return !keep;
++        });
++
++        final int tickCount = server.getTickCount();
++        mspt = averageMspt(server, tickCount);
++
++        final List<ServerPlayer> players = server.getPlayerList().getPlayers();
++        final int limit = players.isEmpty() ? PrecacheSettings.maxConcurrentIdle() : PrecacheSettings.maxConcurrent();
++        concurrentLimit = limit;
++
++        WorldPrecache.State pause = null;
++        if (paused) {
++            pause = WorldPrecache.State.PAUSED_MANUAL;
++        } else if (mspt > PrecacheSettings.maxMspt()) {
++            pause = WorldPrecache.State.PAUSED_MSPT;
++        } else if (playersBusy(players)) {
++            pause = WorldPrecache.State.PAUSED_PLAYERS;
++        }
++
++        int generating = 0;
++        for (final WorldPrecache world : WORLDS.values()) {
++            generating += world.generatingCount();
++        }
++        for (final WorldPrecache world : WORLDS.values()) {
++            // the limit is shared by all worlds
++            world.tick(tickCount, pause, Math.max(0, limit - (generating - world.generatingCount())));
++        }
++    }
++
++    private static boolean playersBusy(final List<ServerPlayer> players) {
++        for (final ServerPlayer player : players) {
++            if (player.chunkLoader != null && player.chunkLoader.kodamaPendingWork() > PLAYER_BUSY_THRESHOLD) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Average tick time of the last second in milliseconds. The tick that is running is already recorded when this runs.
++     */
++    private static double averageMspt(final MinecraftServer server, final int tickCount) {
++        final long[] times = server.getTickTimesNanos();
++        final int samples = Math.max(1, Math.min(MSPT_WINDOW_TICKS, tickCount));
++        long total = 0L;
++        for (int i = 0; i < samples; i++) {
++            total += times[Math.floorMod(tickCount - i, times.length)];
++        }
++        return total / (double)samples / 1.0E6;
++    }
++
++    /**
++     * Saves the progress and stops scheduling; called once while the server shuts down.
++     */
++    public static void shutdown() {
++        if (stopped) {
++            return;
++        }
++        stopped = true;
++        final ExecutorService executor;
++        synchronized (PrecacheManager.class) {
++            executor = io;
++            io = null;
++        }
++        if (executor != null) {
++            executor.shutdown();
++            try {
++                if (!executor.awaitTermination(5L, TimeUnit.SECONDS)) {
++                    LOGGER.warn("The precache IO thread did not finish in time");
++                }
++            } catch (final InterruptedException e) {
++                Thread.currentThread().interrupt();
++            }
++        }
++        for (final WorldPrecache world : WORLDS.values()) {
++            world.saveNow();
++        }
++    }
++
++    /**
++     * Whether the ChunkLoadEvent of this chunk is skipped: only for chunks that the pre-generation is loading right now,
++     * and only when {@code precache.fire-chunk-load-event} is false.
++     */
++    public static boolean suppressChunkLoadEvent(final ServerLevel level, final int chunkX, final int chunkZ) {
++        if (WORLDS.isEmpty() || PrecacheSettings.fireChunkLoadEvent()) {
++            return false;
++        }
++        final WorldPrecache world = WORLDS.get(level);
++        return world != null && world.isPrecacheChunk(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++    }
++
++    // commands and status
++
++    public static boolean isPaused() {
++        return paused;
++    }
++
++    public static void setPaused(final boolean value) {
++        paused = value;
++    }
++
++    public static double lastMspt() {
++        return mspt;
++    }
++
++    public static int concurrentLimit() {
++        return concurrentLimit;
++    }
++
++    /**
++     * One line per world that is selected for pre-generation.
++     */
++    public static List<String> describeWorlds(final MinecraftServer server) {
++        final List<String> lines = new ArrayList<>();
++        for (final ServerLevel level : server.getAllLevels()) {
++            if (!PrecacheSettings.worldSelected(server, level)) {
++                continue;
++            }
++            final WorldPrecache world = WORLDS.get(level);
++            final String name = level.getWorld().getName();
++            if (!PrecacheSettings.configuredEnabled() || PrecacheSettings.tripped() || world == null) {
++                lines.add(name + ": disabled" + (PrecacheSettings.tripped() ? " (too many errors)" : ""));
++                continue;
++            }
++            final long disk = world.diskBytes();
++            lines.add(String.format(java.util.Locale.ROOT, "%s: %s, generated %d this session (%d total), %s, %.1f chunks/s, %d in flight%s",
++                name, world.state().text, world.generatedThisSession(), world.generatedTotal(), world.progressText(), world.chunksPerSecond(),
++                world.generatingCount(), disk < 0 ? "" : String.format(java.util.Locale.ROOT, ", region folder %d MB", disk >> 20)));
++        }
++        return lines;
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/precache/PrecacheProgress.java b/src/main/java/dev/kodama/chunk/precache/PrecacheProgress.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e48689999d09134becbd70de19ff5e8f6bd78ef
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/PrecacheProgress.java
+@@ -0,0 +1,95 @@
++package dev.kodama.chunk.precache;
++
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.nio.file.AtomicMoveNotSupportedException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * The persisted state of one world, {@code kodama-precache.dat} in the world folder: the finished spawn rings, the
++ * total number of generated chunks and the heat map with the finished rings of its cells.
++ */
++final class PrecacheProgress {
++
++    static final String FILE_NAME = "kodama-precache.dat";
++
++    private static final int MAGIC = 0x4B505243; // "KPRC"
++    private static final int VERSION = 1;
++
++    final int spawnChunkX;
++    final int spawnChunkZ;
++    final int spawnCompletedRing;
++    final long totalGenerated;
++    final Heatmap heatmap;
++
++    PrecacheProgress(final int spawnChunkX, final int spawnChunkZ, final int spawnCompletedRing, final long totalGenerated, final Heatmap heatmap) {
++        this.spawnChunkX = spawnChunkX;
++        this.spawnChunkZ = spawnChunkZ;
++        this.spawnCompletedRing = spawnCompletedRing;
++        this.totalGenerated = totalGenerated;
++        this.heatmap = heatmap;
++    }
++
++    byte[] serialize() throws IOException {
++        final ByteArrayOutputStream bytes = new ByteArrayOutputStream(64 + this.heatmap.size() * 13);
++        try (DataOutputStream out = new DataOutputStream(bytes)) {
++            out.writeInt(MAGIC);
++            out.writeInt(VERSION);
++            out.writeInt(this.spawnChunkX);
++            out.writeInt(this.spawnChunkZ);
++            out.writeInt(this.spawnCompletedRing);
++            out.writeLong(this.totalGenerated);
++            out.writeInt(this.heatmap.size());
++            for (final Heatmap.Cell cell : this.heatmap.cells()) {
++                out.writeInt(cell.cellX);
++                out.writeInt(cell.cellZ);
++                out.writeFloat(cell.heat);
++                out.writeByte(cell.ring);
++            }
++        }
++        return bytes.toByteArray();
++    }
++
++    /**
++     * @return the stored progress, or null when there is none or it cannot be read
++     */
++    static @Nullable PrecacheProgress read(final Path file) throws IOException {
++        if (!Files.isRegularFile(file)) {
++            return null;
++        }
++        try (DataInputStream in = new DataInputStream(Files.newInputStream(file))) {
++            if (in.readInt() != MAGIC || in.readInt() != VERSION) {
++                return null;
++            }
++            final int spawnChunkX = in.readInt();
++            final int spawnChunkZ = in.readInt();
++            final int spawnCompletedRing = in.readInt();
++            final long totalGenerated = in.readLong();
++            final int count = in.readInt();
++            final Heatmap heatmap = new Heatmap();
++            for (int i = 0; i < count; i++) {
++                final Heatmap.Cell cell = heatmap.cellOrCreate(in.readInt(), in.readInt());
++                cell.heat = in.readFloat();
++                cell.ring = in.readByte();
++            }
++            return new PrecacheProgress(spawnChunkX, spawnChunkZ, spawnCompletedRing, totalGenerated, heatmap);
++        } catch (final java.io.EOFException truncated) {
++            return null;
++        }
++    }
++
++    static void write(final Path file, final byte[] data) throws IOException {
++        final Path temporary = file.resolveSibling(FILE_NAME + ".tmp");
++        Files.write(temporary, data);
++        try {
++            Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
++        } catch (final AtomicMoveNotSupportedException e) {
++            Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java b/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..67431a9df112b02d5249b3b40ad6b11e921173e6
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java
+@@ -0,0 +1,94 @@
++package dev.kodama.chunk.precache;
++
++import dev.kodama.config.KodamaGlobalConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import java.util.List;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Read-only view of the {@code precache} section with the {@link FeatureGuard} state already applied. Every call reads
++ * the live configuration.
++ */
++final class PrecacheSettings {
++
++    static final String FEATURE_ID = "precache";
++
++    private static final String MAIN_WORLD_ALIAS = "world";
++
++    private PrecacheSettings() {
++    }
++
++    private static KodamaGlobalConfiguration.@Nullable Precache section() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null ? null : config.precache;
++    }
++
++    static boolean configuredEnabled() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section != null && section.enabled.isTrue();
++    }
++
++    static boolean tripped() {
++        return FeatureGuard.isTripped(FEATURE_ID);
++    }
++
++    static boolean enabled() {
++        return configuredEnabled() && !tripped();
++    }
++
++    static boolean worldSelected(final MinecraftServer server, final ServerLevel level) {
++        final KodamaGlobalConfiguration.Precache section = section();
++        if (section == null) {
++            return false;
++        }
++        final List<String> worlds = section.worlds;
++        if (worlds == null || worlds.isEmpty()) {
++            return true;
++        }
++        final String name = level.getWorld().getName();
++        final boolean mainOverworld = level == server.overworld();
++        for (final String entry : worlds) {
++            if (entry.equalsIgnoreCase(name) || (mainOverworld && entry.equalsIgnoreCase(MAIN_WORLD_ALIAS))) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    static double maxMspt() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section == null ? 35.0 : section.maxMspt;
++    }
++
++    static int maxConcurrent() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section == null ? 8 : Math.max(1, section.maxConcurrent);
++    }
++
++    static int maxConcurrentIdle() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section == null ? 32 : Math.max(1, section.maxConcurrentIdle);
++    }
++
++    static int maxRadiusBlocks() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section == null ? 5000 : Math.max(16, section.maxRadius);
++    }
++
++    static long maxDiskBytes() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return (section == null ? 4096L : Math.max(1L, section.maxDiskMb)) * 1024L * 1024L;
++    }
++
++    static double explorerNewChunksPerMinute() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section == null ? 30.0 : section.explorerNewChunksPerMinute;
++    }
++
++    static boolean fireChunkLoadEvent() {
++        final KodamaGlobalConfiguration.Precache section = section();
++        return section == null || section.fireChunkLoadEvent;
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/precache/PrecacheStatus.java b/src/main/java/dev/kodama/chunk/precache/PrecacheStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..09717088ecb0f99bab34665bfe79f408a16c2900
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/PrecacheStatus.java
+@@ -0,0 +1,42 @@
++package dev.kodama.chunk.precache;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import java.util.List;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.TextComponent;
++import net.minecraft.server.MinecraftServer;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++
++/**
++ * The {@code /kodama status} line of the pre-generation.
++ */
++public final class PrecacheStatus {
++
++    private PrecacheStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Precache progress";
++            }
++
++            @Override
++            public Component describe() {
++                final List<String> lines = PrecacheManager.describeWorlds(MinecraftServer.getServer());
++                if (lines.isEmpty()) {
++                    return text("no world selected", GRAY);
++                }
++                TextComponent result = text("");
++                for (final String line : lines) {
++                    result = result.append(text("\n  " + line, GRAY));
++                }
++                return result;
++            }
++        });
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/precache/RingSource.java b/src/main/java/dev/kodama/chunk/precache/RingSource.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..da955af1ad39bd8b495ac474ebfc75c717c47825
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/RingSource.java
+@@ -0,0 +1,144 @@
++package dev.kodama.chunk.precache;
++
++import io.papermc.paper.util.CoordinateUtils;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.IntSupplier;
++
++/**
++ * Hands out the chunks of square rings (Chebyshev distance) around a center, nearest ring first. A ring only counts as
++ * completed when every chunk handed out from it was checked and, if it was missing, generated; the next ring starts
++ * after that, so {@link #completedRing()} is always safe to persist. Main thread only, except for {@link #outstanding}.
++ */
++class RingSource {
++
++    interface Filter {
++        boolean accepts(int chunkX, int chunkZ, int dx, int dz);
++    }
++
++    /**
++     * Chunks of this source that were handed out and are not checked or generated yet; written by several threads.
++     */
++    final AtomicInteger outstanding = new AtomicInteger();
++
++    private final int centerX;
++    private final int centerZ;
++    private final IntSupplier limitRing;
++    private final Filter filter;
++    private int ring;
++    private int index;
++    private int completedRing;
++
++    RingSource(final int centerX, final int centerZ, final int completedRing, final IntSupplier limitRing, final Filter filter) {
++        this.centerX = centerX;
++        this.centerZ = centerZ;
++        this.completedRing = completedRing;
++        this.ring = completedRing + 1;
++        this.limitRing = limitRing;
++        this.filter = filter;
++    }
++
++    final int centerX() {
++        return this.centerX;
++    }
++
++    final int centerZ() {
++        return this.centerZ;
++    }
++
++    /**
++     * The ring that is being worked on.
++     */
++    final int ring() {
++        return this.ring;
++    }
++
++    final int completedRing() {
++        return this.completedRing;
++    }
++
++    final int limit() {
++        return this.limitRing.getAsInt();
++    }
++
++    boolean exhausted() {
++        return this.ring > this.limitRing.getAsInt();
++    }
++
++    /**
++     * Writes up to {@code max} chunk keys that still have to be checked into {@code out} and counts them as outstanding.
++     */
++    int pull(final long[] out, final int max) {
++        final int limit = this.limitRing.getAsInt();
++        int count = 0;
++        while (count < max && this.ring <= limit) {
++            final int size = ringSize(this.ring);
++            if (this.index >= size) {
++                break; // wait until the whole ring is done
++            }
++            final int position = this.index++;
++            final int dx = offsetX(this.ring, position);
++            final int dz = offsetZ(this.ring, position);
++            final int chunkX = this.centerX + dx;
++            final int chunkZ = this.centerZ + dz;
++            if (!this.filter.accepts(chunkX, chunkZ, dx, dz)) {
++                continue;
++            }
++            out[count++] = CoordinateUtils.getChunkKey(chunkX, chunkZ);
++            this.outstanding.incrementAndGet();
++        }
++        return count;
++    }
++
++    /**
++     * Moves on to the next ring when the current one is fully handed out and finished.
++     *
++     * @return whether a ring was completed
++     */
++    boolean advance() {
++        if (this.ring > this.limitRing.getAsInt() || this.index < ringSize(this.ring) || this.outstanding.get() != 0) {
++            return false;
++        }
++        this.completedRing = this.ring;
++        this.onRingCompleted(this.ring);
++        this.ring++;
++        this.index = 0;
++        return true;
++    }
++
++    void onRingCompleted(final int completed) {
++    }
++
++    static int ringSize(final int ring) {
++        return ring == 0 ? 1 : ring * 8;
++    }
++
++    private static int offsetX(final int ring, final int position) {
++        if (ring == 0) {
++            return 0;
++        }
++        final int side = ring * 2;
++        final int segment = position / side;
++        final int offset = position % side;
++        return switch (segment) {
++            case 0 -> -ring + offset;
++            case 1 -> ring;
++            case 2 -> ring - offset;
++            default -> -ring;
++        };
++    }
++
++    private static int offsetZ(final int ring, final int position) {
++        if (ring == 0) {
++            return 0;
++        }
++        final int side = ring * 2;
++        final int segment = position / side;
++        final int offset = position % side;
++        return switch (segment) {
++            case 0 -> -ring;
++            case 1 -> -ring + offset;
++            case 2 -> ring;
++            default -> ring - offset;
++        };
++    }
++}
+diff --git a/src/main/java/dev/kodama/chunk/precache/WorldPrecache.java b/src/main/java/dev/kodama/chunk/precache/WorldPrecache.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b49040cd276191052a51b3657ebdc4bce362530
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/precache/WorldPrecache.java
+@@ -0,0 +1,655 @@
++package dev.kodama.chunk.precache;
++
++import ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor;
++import com.mojang.logging.LogUtils;
++import dev.kodama.chunk.ChunkLoadingSettings;
++import dev.kodama.chunk.PlayerMotion;
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.chunk.system.io.RegionFileIOThread;
++import io.papermc.paper.chunk.system.scheduling.NewChunkHolder;
++import io.papermc.paper.util.CoordinateUtils;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
++import it.unimi.dsi.fastutil.longs.LongSets;
++import java.io.IOException;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.Executor;
++import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
++import net.minecraft.core.BlockPos;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.border.WorldBorder;
++import net.minecraft.world.level.chunk.status.ChunkStatus;
++import net.minecraft.world.level.chunk.storage.ChunkSerializer;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.slf4j.Logger;
++
++/**
++ * The pre-generation of one world. {@link #tick} runs on the main thread and only does bookkeeping: it picks chunks from
++ * the sources (spawn rings, hot cells of the heat map, a cone ahead of each moving player), lets the IO thread find out
++ * which of them are missing on disk, and starts the generation of the missing ones at the lowest priority through the
++ * chunk system. The chunk gets a short-lived ticket and unloads, saved by the normal path, once it is generated.
++ */
++final class WorldPrecache {
++
++    enum State {
++        LOADING("loading"),
++        RUNNING("running"),
++        PAUSED_MSPT("paused: mspt"),
++        PAUSED_PLAYERS("paused: players busy"),
++        PAUSED_MANUAL("paused: manual"),
++        DONE("done"),
++        DONE_DISK("done (disk limit)"),
++        DISABLED("disabled");
++
++        final String text;
++
++        State(final String text) {
++            this.text = text;
++        }
++    }
++
++    private record Job(long chunk, RingSource source) {
++    }
++
++    private enum DiskState {
++        MISSING, PARTIAL, FULL, UNKNOWN
++    }
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++
++    private static final long NEVER = -1_000_000_000L; // far enough in the past, and subtracting it cannot overflow
++    private static final int SAMPLE_INTERVAL_TICKS = 100;
++    private static final int MINUTE_TICKS = 1200;
++    private static final int LIMIT_INTERVAL_TICKS = 20;
++    private static final int MAX_STARTS_PER_TICK = 4;
++    private static final int PULL_BATCH = 8;
++    private static final int RATE_SAMPLES = 11;
++    private static final int CONE_DEPTH_CHUNKS = 48;
++    private static final double CONE_HALF_ANGLE_COS = Math.cos(Math.toRadians(35.0));
++    private static final double CONE_RESET_ANGLE_COS = Math.cos(Math.toRadians(30.0));
++    private static final int CONE_RESET_DISTANCE_CHUNKS = 6;
++    private static final int TELEPORT_DISTANCE_CHUNKS = 40;
++    private static final double CONSISTENT_HEADING = 0.5;
++    private static final float HOT_MIN_HEAT = 3.0F;
++    private static final float HEAT_DECAY_PER_MINUTE = 0.95F;
++    private static final int AHEAD_CHUNKS = 64; // two cells
++
++    private final ServerLevel level;
++    private final Executor io;
++    private final Path datFile;
++    private final Path regionFolder;
++    private final int spawnChunkX;
++    private final int spawnChunkZ;
++
++    private volatile boolean loaded;
++    private Heatmap heatmap = new Heatmap();
++    private long totalBase;
++    private volatile @Nullable RingSource spawn;
++    private volatile @Nullable RingSource hot;
++    private volatile Heatmap.@Nullable Cell hotCell;
++    private final Map<UUID, PlayerTrack> tracks = new HashMap<>();
++    private final List<RingSource> rotation = new ArrayList<>();
++    private int rotationPosition;
++
++    private final ConcurrentLinkedQueue<Job> toGenerate = new ConcurrentLinkedQueue<>();
++    private final AtomicInteger checking = new AtomicInteger();
++    private final AtomicInteger generating = new AtomicInteger();
++    private final AtomicLong generated = new AtomicLong();
++    // chunks started by this feature that are not finished yet; read by the ChunkLoadEvent guard
++    private final LongSet precacheChunks = LongSets.synchronize(new LongOpenHashSet());
++
++    private volatile long diskBytes = -1L;
++    private volatile State state = State.LOADING;
++    private volatile int maxChunks = 1;
++    private volatile int ringLimit = 1;
++    private long lastLimitTick = NEVER;
++    private long lastSampleTick = NEVER;
++    private long lastRotationTick = NEVER;
++    private long lastMinuteTick = Long.MIN_VALUE;
++    private long lastRateTick = NEVER;
++    private final long[] rateSamples = new long[RATE_SAMPLES];
++    private int rateCount;
++    private volatile double chunksPerSecond;
++
++    WorldPrecache(final MinecraftServer server, final ServerLevel level, final Executor io) {
++        this.level = level;
++        this.io = io;
++        this.datFile = level.getWorld().getWorldFolder().toPath().resolve(PrecacheProgress.FILE_NAME);
++        this.regionFolder = level.convertable.getDimensionPath(level.dimension()).resolve("region");
++        final BlockPos spawnPos = level.getSharedSpawnPos();
++        this.spawnChunkX = spawnPos.getX() >> 4;
++        this.spawnChunkZ = spawnPos.getZ() >> 4;
++        io.execute(this::loadProgress);
++    }
++
++    // state for the status output
++
++    String worldName() {
++        return this.level.getWorld().getName();
++    }
++
++    State state() {
++        return this.state;
++    }
++
++    void markDisabled() {
++        this.state = State.DISABLED;
++    }
++
++    long generatedThisSession() {
++        return this.generated.get();
++    }
++
++    long generatedTotal() {
++        return this.totalBase + this.generated.get();
++    }
++
++    int generatingCount() {
++        return this.generating.get();
++    }
++
++    double chunksPerSecond() {
++        return this.chunksPerSecond;
++    }
++
++    long diskBytes() {
++        return this.diskBytes;
++    }
++
++    boolean isPrecacheChunk(final long chunk) {
++        return this.precacheChunks.contains(chunk);
++    }
++
++    String progressText() {
++        final RingSource spawn = this.spawn;
++        if (!this.loaded || spawn == null) {
++            return "loading";
++        }
++        final StringBuilder text = new StringBuilder();
++        text.append("spawn ring ").append(Math.min(spawn.ring(), spawn.limit())).append('/').append(spawn.limit());
++        final RingSource hot = this.hot;
++        final Heatmap.Cell hotCell = this.hotCell;
++        if (hot != null && hotCell != null) {
++            text.append(", hot cell ").append(hotCell.cellX).append(',').append(hotCell.cellZ).append(" ring ")
++                .append(Math.min(hot.ring(), Heatmap.DONE_RING)).append('/').append(Heatmap.DONE_RING);
++        }
++        return text.toString();
++    }
++
++    // main thread tick
++
++    /**
++     * @param pause         the reason why nothing may be scheduled right now, or null
++     * @param inFlightLimit the number of chunks this world may have in generation at the same time
++     */
++    void tick(final long tick, final @Nullable State pause, final int inFlightLimit) {
++        if (!this.loaded) {
++            this.state = State.LOADING;
++            return;
++        }
++        if (tick - this.lastLimitTick >= LIMIT_INTERVAL_TICKS) {
++            this.lastLimitTick = tick;
++            this.recomputeLimits();
++        }
++        this.housekeeping(tick);
++        if (pause != null) {
++            this.state = pause;
++            return;
++        }
++        if (this.diskBytes > PrecacheSettings.maxDiskBytes()) {
++            this.state = State.DONE_DISK;
++            return;
++        }
++
++        this.startGenerations(inFlightLimit);
++        final int pulled = this.refill(tick, inFlightLimit);
++        this.advanceSources();
++
++        final boolean busy = pulled > 0 || this.checking.get() > 0 || !this.toGenerate.isEmpty() || this.generating.get() > 0;
++        this.state = busy || this.hasActiveSource() ? State.RUNNING : State.DONE;
++    }
++
++    private void housekeeping(final long tick) {
++        if (this.lastMinuteTick == Long.MIN_VALUE) {
++            this.lastMinuteTick = tick;
++            this.submitDiskCheck();
++        }
++        if (tick - this.lastSampleTick >= SAMPLE_INTERVAL_TICKS) {
++            this.lastSampleTick = tick;
++            this.samplePlayers();
++            this.selectHotCell();
++        }
++        if (tick - this.lastRateTick >= 20) {
++            this.lastRateTick = tick;
++            this.sampleRate();
++        }
++        if (tick - this.lastMinuteTick >= MINUTE_TICKS) {
++            this.lastMinuteTick = tick;
++            this.heatmap.decay(HEAT_DECAY_PER_MINUTE);
++            this.saveAsync();
++            this.submitDiskCheck();
++        }
++    }
++
++    private void sampleRate() {
++        if (this.rateCount == RATE_SAMPLES) {
++            System.arraycopy(this.rateSamples, 1, this.rateSamples, 0, RATE_SAMPLES - 1);
++            this.rateCount--;
++        }
++        this.rateSamples[this.rateCount++] = this.generated.get();
++        this.chunksPerSecond = this.rateCount < 2 ? 0.0 : (double)(this.rateSamples[this.rateCount - 1] - this.rateSamples[0]) / (this.rateCount - 1);
++    }
++
++    // limits
++
++    private void recomputeLimits() {
++        this.maxChunks = Math.max(1, (PrecacheSettings.maxRadiusBlocks() + 15) >> 4);
++        final WorldBorder border = this.level.getWorldBorder();
++        final int minX = clampChunk(Math.floor(border.getMinX())) - this.spawnChunkX;
++        final int maxX = clampChunk(Math.ceil(border.getMaxX())) - this.spawnChunkX;
++        final int minZ = clampChunk(Math.floor(border.getMinZ())) - this.spawnChunkZ;
++        final int maxZ = clampChunk(Math.ceil(border.getMaxZ())) - this.spawnChunkZ;
++        final int borderLimit = Math.max(Math.max(Math.abs(minX), Math.abs(maxX)), Math.max(Math.abs(minZ), Math.abs(maxZ)));
++        this.ringLimit = Math.min(this.maxChunks, borderLimit);
++    }
++
++    private static int clampChunk(final double block) {
++        return ((int)Math.max(-3.0E7, Math.min(3.0E7, block))) >> 4;
++    }
++
++    private boolean inBounds(final int chunkX, final int chunkZ) {
++        if (Math.abs(chunkX - this.spawnChunkX) > this.maxChunks || Math.abs(chunkZ - this.spawnChunkZ) > this.maxChunks) {
++            return false;
++        }
++        return this.level.getWorldBorder().isChunkInBounds(chunkX, chunkZ);
++    }
++
++    // sources
++
++    private boolean hasActiveSource() {
++        final RingSource spawn = this.spawn;
++        if (spawn != null && !spawn.exhausted()) {
++            return true;
++        }
++        final RingSource hot = this.hot;
++        if (hot != null && !hot.exhausted()) {
++            return true;
++        }
++        for (final PlayerTrack track : this.tracks.values()) {
++            if (track.cone != null && !track.cone.exhausted()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private void advanceSources() {
++        final RingSource spawn = this.spawn;
++        if (spawn != null) {
++            spawn.advance();
++        }
++        final RingSource hot = this.hot;
++        if (hot != null) {
++            hot.advance();
++        }
++        for (final PlayerTrack track : this.tracks.values()) {
++            if (track.cone != null) {
++                track.cone.advance();
++            }
++        }
++    }
++
++    private void rebuildRotation() {
++        this.rotation.clear();
++        for (final PlayerTrack track : this.tracks.values()) {
++            if (track.cone != null && !track.cone.exhausted()) {
++                this.rotation.add(track.cone);
++                if (track.explorer) {
++                    this.rotation.add(track.cone); // explorers get twice the share
++                }
++            }
++        }
++        final RingSource spawn = this.spawn;
++        if (spawn != null && !spawn.exhausted()) {
++            this.rotation.add(spawn);
++        }
++        final RingSource hot = this.hot;
++        if (hot != null && !hot.exhausted()) {
++            this.rotation.add(hot);
++        }
++    }
++
++    private void selectHotCell() {
++        final Heatmap.Cell best = this.heatmap.hottest(this::isHotCandidate);
++        final Heatmap.Cell current = this.hotCell;
++        final RingSource currentSource = this.hot;
++        if (currentSource != null && !currentSource.exhausted() && current != null && (best == null || current.heat * 4.0F >= best.heat)) {
++            return;
++        }
++        if (best == null) {
++            this.hot = null;
++            this.hotCell = null;
++            return;
++        }
++        this.hotCell = best;
++        this.hot = new RingSource(best.centerChunkX(), best.centerChunkZ(), best.ring, () -> Heatmap.DONE_RING, (x, z, dx, dz) -> this.inBounds(x, z)) {
++            @Override
++            void onRingCompleted(final int completed) {
++                best.ring = completed;
++            }
++        };
++    }
++
++    private boolean isHotCandidate(final Heatmap.Cell cell) {
++        return cell.heat >= HOT_MIN_HEAT && cell.ring < Heatmap.DONE_RING
++            && Math.abs(cell.centerChunkX() - this.spawnChunkX) <= this.maxChunks + Heatmap.DONE_RING
++            && Math.abs(cell.centerChunkZ() - this.spawnChunkZ) <= this.maxChunks + Heatmap.DONE_RING;
++    }
++
++    // players
++
++    private final class PlayerTrack {
++        boolean hasLast;
++        int lastChunkX;
++        int lastChunkZ;
++        double headingX;
++        double headingZ;
++        double chunksPerMinute;
++        boolean explorer;
++        @Nullable RingSource cone;
++        int coneX;
++        int coneZ;
++        double coneHeadingX;
++        double coneHeadingZ;
++
++        void update(final ServerPlayer player) {
++            final ChunkPos position = player.chunkPosition();
++            if (this.hasLast) {
++                final int dx = position.x - this.lastChunkX;
++                final int dz = position.z - this.lastChunkZ;
++                final double distance = Math.sqrt((double)dx * dx + (double)dz * dz);
++                if (distance <= TELEPORT_DISTANCE_CHUNKS) {
++                    final double stepX = distance == 0.0 ? 0.0 : dx / distance;
++                    final double stepZ = distance == 0.0 ? 0.0 : dz / distance;
++                    this.headingX = this.headingX * 0.7 + stepX * 0.3;
++                    this.headingZ = this.headingZ * 0.7 + stepZ * 0.3;
++                    this.chunksPerMinute = this.chunksPerMinute * 0.7 + distance * (MINUTE_TICKS / (double)SAMPLE_INTERVAL_TICKS) * 0.3;
++                }
++            }
++            this.hasLast = true;
++            this.lastChunkX = position.x;
++            this.lastChunkZ = position.z;
++
++            double newChunksPerMinute = this.chunksPerMinute;
++            if (player.chunkLoader != null && ChunkLoadingSettings.masterEnabled()) {
++                final PlayerMotion motion = player.chunkLoader.kodamaMotion();
++                newChunksPerMinute = motion.newChunksPerMinute();
++            }
++            this.explorer = newChunksPerMinute >= PrecacheSettings.explorerNewChunksPerMinute();
++
++            final double magnitude = Math.sqrt(this.headingX * this.headingX + this.headingZ * this.headingZ);
++            final boolean consistent = magnitude >= CONSISTENT_HEADING;
++            final double unitX = consistent ? this.headingX / magnitude : 0.0;
++            final double unitZ = consistent ? this.headingZ / magnitude : 0.0;
++
++            WorldPrecache.this.heatmap.addHeat(position.x, position.z, 1.0F);
++            if (consistent && this.explorer) {
++                WorldPrecache.this.heatmap.addHeat(position.x + (int)Math.round(unitX * AHEAD_CHUNKS), position.z + (int)Math.round(unitZ * AHEAD_CHUNKS), 0.5F);
++            }
++
++            if (consistent && this.chunksPerMinute >= 1.0) {
++                final int fromOrigin = Math.max(Math.abs(position.x - this.coneX), Math.abs(position.z - this.coneZ));
++                if (this.cone == null || fromOrigin > CONE_RESET_DISTANCE_CHUNKS
++                    || unitX * this.coneHeadingX + unitZ * this.coneHeadingZ < CONE_RESET_ANGLE_COS) {
++                    this.startCone(position.x, position.z, unitX, unitZ);
++                }
++            }
++        }
++
++        private void startCone(final int chunkX, final int chunkZ, final double unitX, final double unitZ) {
++            this.coneX = chunkX;
++            this.coneZ = chunkZ;
++            this.coneHeadingX = unitX;
++            this.coneHeadingZ = unitZ;
++            final int start = Math.max(2, WorldPrecache.this.level.getWorld().getViewDistance() + 1);
++            final int end = start + CONE_DEPTH_CHUNKS;
++            this.cone = new RingSource(chunkX, chunkZ, start - 1, () -> end, (x, z, dx, dz) ->
++                dx * unitX + dz * unitZ >= CONE_HALF_ANGLE_COS * Math.sqrt((double)dx * dx + (double)dz * dz) && WorldPrecache.this.inBounds(x, z));
++        }
++    }
++
++    private void samplePlayers() {
++        final Set<UUID> present = new HashSet<>();
++        for (final ServerPlayer player : this.level.players()) {
++            present.add(player.getUUID());
++            this.tracks.computeIfAbsent(player.getUUID(), id -> new PlayerTrack()).update(player);
++        }
++        this.tracks.keySet().retainAll(present);
++    }
++
++    // pipeline
++
++    private int refill(final long tick, final int inFlightLimit) {
++        if (tick - this.lastRotationTick >= LIMIT_INTERVAL_TICKS) {
++            this.lastRotationTick = tick;
++            this.rebuildRotation();
++        }
++        final int want = Math.min(PULL_BATCH * 4, inFlightLimit * 2 - this.checking.get() - this.toGenerate.size());
++        if (want <= 0 || this.rotation.isEmpty()) {
++            return 0;
++        }
++        final long[] buffer = new long[PULL_BATCH];
++        int total = 0;
++        int idle = 0;
++        while (total < want && idle < this.rotation.size()) {
++            final RingSource source = this.rotation.get(Math.floorMod(this.rotationPosition++, this.rotation.size()));
++            final int count = source.pull(buffer, Math.min(PULL_BATCH, want - total));
++            if (count == 0) {
++                idle++;
++                continue;
++            }
++            idle = 0;
++            total += count;
++            this.submitCheck(source, Arrays.copyOf(buffer, count));
++        }
++        return total;
++    }
++
++    private void submitCheck(final RingSource source, final long[] chunks) {
++        this.checking.addAndGet(chunks.length);
++        try {
++            this.io.execute(() -> this.checkOnIoThread(source, chunks));
++        } catch (final RejectedExecutionException e) {
++            this.checking.addAndGet(-chunks.length);
++            source.outstanding.addAndGet(-chunks.length);
++        }
++    }
++
++    private void checkOnIoThread(final RingSource source, final long[] chunks) {
++        for (final long chunk : chunks) {
++            try {
++                if (this.isGenerated(CoordinateUtils.getChunkX(chunk), CoordinateUtils.getChunkZ(chunk))) {
++                    source.outstanding.decrementAndGet();
++                } else {
++                    this.toGenerate.add(new Job(chunk, source));
++                }
++            } catch (final Throwable throwable) {
++                source.outstanding.decrementAndGet(); // when in doubt, leave the chunk alone
++                FeatureGuard.reportFailure(PrecacheSettings.FEATURE_ID, throwable);
++            } finally {
++                this.checking.decrementAndGet();
++            }
++        }
++    }
++
++    /**
++     * Whether the chunk is already fully generated, in memory, about to be written or in its region file. Chunks that
++     * only exist as an unfinished neighbor of another chunk do not count: they still have to be completed. The status
++     * is cached per region file by the chunk system, otherwise the chunk is read once. May touch the disk, so it must
++     * not run on the main thread.
++     */
++    private boolean isGenerated(final int chunkX, final int chunkZ) throws IOException {
++        final NewChunkHolder holder = this.level.chunkTaskScheduler.chunkHolderManager.getChunkHolder(chunkX, chunkZ);
++        if (holder != null && holder.getCurrentGenStatus() == ChunkStatus.FULL) {
++            return true;
++        }
++        final CompoundTag pending = RegionFileIOThread.getPendingWrite(this.level, chunkX, chunkZ, RegionFileIOThread.RegionFileType.CHUNK_DATA);
++        if (pending != null) {
++            return ChunkSerializer.getStatus(pending) == ChunkStatus.FULL;
++        }
++        final ChunkPos position = new ChunkPos(chunkX, chunkZ);
++        final DiskState disk = this.level.chunkDataControllerNew.computeForRegionFile(chunkX, chunkZ, true, regionFile -> {
++            if (regionFile == null || !regionFile.hasChunk(position)) {
++                return DiskState.MISSING;
++            }
++            final ChunkStatus cached = regionFile.getStatusIfCached(chunkX, chunkZ);
++            return cached == null ? DiskState.UNKNOWN : cached == ChunkStatus.FULL ? DiskState.FULL : DiskState.PARTIAL;
++        });
++        if (disk == DiskState.UNKNOWN) {
++            // not read in this session yet; the region file lock must not be held while the IO thread works for us
++            final CompoundTag tag = RegionFileIOThread.loadData(this.level, chunkX, chunkZ, RegionFileIOThread.RegionFileType.CHUNK_DATA, PrioritisedExecutor.Priority.LOW);
++            return tag != null && ChunkSerializer.getStatus(tag) == ChunkStatus.FULL;
++        }
++        return disk == DiskState.FULL;
++    }
++
++    private void startGenerations(final int inFlightLimit) {
++        int started = 0;
++        while (started < MAX_STARTS_PER_TICK && this.generating.get() < inFlightLimit) {
++            final Job job = this.toGenerate.poll();
++            if (job == null) {
++                return;
++            }
++            started++;
++            this.startGeneration(job);
++        }
++    }
++
++    private void startGeneration(final Job job) {
++        final long chunk = job.chunk();
++        final int chunkX = CoordinateUtils.getChunkX(chunk);
++        final int chunkZ = CoordinateUtils.getChunkZ(chunk);
++        if (this.level.chunkSource.getChunkAtIfLoadedMainThreadNoCache(chunkX, chunkZ) != null) {
++            job.source().outstanding.decrementAndGet(); // a player got there first
++            return;
++        }
++        this.generating.incrementAndGet();
++        this.precacheChunks.add(chunk);
++        try {
++            this.level.chunkTaskScheduler.scheduleChunkLoad(chunkX, chunkZ, ChunkStatus.FULL, true, PrioritisedExecutor.Priority.IDLE, loaded -> {
++                this.precacheChunks.remove(chunk);
++                if (loaded != null) {
++                    this.generated.incrementAndGet();
++                }
++                this.generating.decrementAndGet();
++                job.source().outstanding.decrementAndGet();
++            });
++        } catch (final Throwable throwable) {
++            this.precacheChunks.remove(chunk);
++            this.generating.decrementAndGet();
++            job.source().outstanding.decrementAndGet();
++            throw throwable;
++        }
++    }
++
++    // persistence
++
++    private void loadProgress() {
++        int completedRing = -1;
++        try {
++            final PrecacheProgress progress = PrecacheProgress.read(this.datFile);
++            if (progress != null) {
++                this.heatmap = progress.heatmap;
++                this.totalBase = progress.totalGenerated;
++                if (progress.spawnChunkX == this.spawnChunkX && progress.spawnChunkZ == this.spawnChunkZ) {
++                    completedRing = progress.spawnCompletedRing;
++                }
++            }
++        } catch (final IOException | RuntimeException e) {
++            LOGGER.warn("Could not read the precache progress of world '{}', starting over: {}", this.worldName(), e.toString());
++        }
++        this.spawn = new RingSource(this.spawnChunkX, this.spawnChunkZ, completedRing, () -> this.ringLimit, (x, z, dx, dz) -> this.inBounds(x, z));
++        this.loaded = true;
++        LOGGER.info("Precache of world '{}' resumes after spawn ring {} ({} chunks generated so far)", this.worldName(), completedRing, this.totalBase);
++    }
++
++    private byte[] snapshot() throws IOException {
++        final RingSource spawn = this.spawn;
++        return new PrecacheProgress(this.spawnChunkX, this.spawnChunkZ, spawn == null ? -1 : spawn.completedRing(), this.generatedTotal(), this.heatmap).serialize();
++    }
++
++    private void saveAsync() {
++        try {
++            final byte[] data = this.snapshot();
++            this.io.execute(() -> this.write(data));
++        } catch (final IOException | RejectedExecutionException e) {
++            LOGGER.warn("Could not save the precache progress of world '{}': {}", this.worldName(), e.toString());
++        }
++    }
++
++    /**
++     * Writes the progress on the calling thread; used at shutdown, after the IO executor has finished its tasks.
++     */
++    void saveNow() {
++        if (!this.loaded) {
++            return;
++        }
++        try {
++            this.write(this.snapshot());
++        } catch (final IOException e) {
++            LOGGER.warn("Could not save the precache progress of world '{}': {}", this.worldName(), e.toString());
++        }
++    }
++
++    private void write(final byte[] data) {
++        try {
++            PrecacheProgress.write(this.datFile, data);
++        } catch (final IOException e) {
++            LOGGER.warn("Could not write {}: {}", this.datFile, e.toString());
++        }
++    }
++
++    private void submitDiskCheck() {
++        try {
++            this.io.execute(() -> this.diskBytes = folderSize(this.regionFolder));
++        } catch (final RejectedExecutionException ignored) {
++            // shutting down
++        }
++    }
++
++    private static long folderSize(final Path folder) {
++        long total = 0L;
++        if (!Files.isDirectory(folder)) {
++            return 0L;
++        }
++        try (DirectoryStream<Path> files = Files.newDirectoryStream(folder)) {
++            for (final Path file : files) {
++                try {
++                    total += Files.size(file);
++                } catch (final IOException ignored) {
++                    // the file was removed meanwhile
++                }
++            }
++        } catch (final IOException e) {
++            return 0L;
++        }
++        return total;
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/KodamaCommand.java b/src/main/java/dev/kodama/command/KodamaCommand.java
+index a4459e22b4abbc654ac56b35647e6441f0b03f6a..deec776d0dec0e8571cd9cf0f7c3f3fda3da2036 100644
+--- a/src/main/java/dev/kodama/command/KodamaCommand.java
++++ b/src/main/java/dev/kodama/command/KodamaCommand.java
+@@ -1,6 +1,7 @@
+ package dev.kodama.command;
+ 
+ import dev.kodama.command.subcommands.ConfigCommand;
++import dev.kodama.command.subcommands.PrecacheCommand;
+ import dev.kodama.command.subcommands.ReloadCommand;
+ import dev.kodama.command.subcommands.StatusCommand;
+ import dev.kodama.command.subcommands.VersionCommand;
+@@ -40,6 +41,7 @@ public final class KodamaCommand extends Command {
+         SUBCOMMANDS.put(StatusCommand.LITERAL_ARGUMENT, new StatusCommand());
+         SUBCOMMANDS.put(VersionCommand.LITERAL_ARGUMENT, new VersionCommand());
+         SUBCOMMANDS.put(ConfigCommand.LITERAL_ARGUMENT, new ConfigCommand());
++        SUBCOMMANDS.put(PrecacheCommand.LITERAL_ARGUMENT, new PrecacheCommand());
+     }
+ 
+     public KodamaCommand() {
+diff --git a/src/main/java/dev/kodama/command/subcommands/PrecacheCommand.java b/src/main/java/dev/kodama/command/subcommands/PrecacheCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..29c6b637cdc7e94b79856d38274d3c789ce88741
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/PrecacheCommand.java
+@@ -0,0 +1,77 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.chunk.precache.PrecacheManager;
++import dev.kodama.command.Completions;
++import dev.kodama.command.KodamaCommands;
++import dev.kodama.command.PermissionedKodamaSubcommand;
++import java.util.Collections;
++import java.util.List;
++import java.util.Locale;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++import static net.kyori.adventure.text.format.NamedTextColor.YELLOW;
++
++/**
++ * {@code /kodama precache pause|resume|status}: controls the background chunk pre-generation.
++ */
++@DefaultQualifier(NonNull.class)
++public final class PrecacheCommand extends PermissionedKodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "precache";
++    public static final String PERM = KodamaCommands.COMMAND_BASE_PERM + "." + LITERAL_ARGUMENT;
++
++    private static final List<String> ACTIONS = List.of("pause", "resume", "status");
++
++    public PrecacheCommand() {
++        super(PERM, PermissionDefault.OP);
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        final String action = args.length == 0 ? "status" : args[0].toLowerCase(Locale.ROOT);
++        switch (action) {
++            case "pause" -> {
++                PrecacheManager.setPaused(true);
++                sender.sendMessage(text("Precache paused. It stays paused until /kodama precache resume or a restart.", YELLOW));
++            }
++            case "resume" -> {
++                PrecacheManager.setPaused(false);
++                sender.sendMessage(text("Precache resumed.", GREEN));
++            }
++            case "status" -> this.sendStatus(sender);
++            default -> {
++                sender.sendMessage(text("Usage: /kodama precache [pause | resume | status]", RED));
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private void sendStatus(final CommandSender sender) {
++        final MinecraftServer server = MinecraftServer.getServer();
++        sender.sendMessage(text("Kodama precache", GREEN));
++        sender.sendMessage(text(String.format(Locale.ROOT, "Average tick time (last second): %.1f ms, at most %d chunks generated at the same time%s",
++            PrecacheManager.lastMspt(), PrecacheManager.concurrentLimit(), PrecacheManager.isPaused() ? ", paused by command" : ""), GRAY));
++        final List<String> lines = PrecacheManager.describeWorlds(server);
++        if (lines.isEmpty()) {
++            sender.sendMessage(text("No world is selected (precache.worlds).", GRAY));
++        }
++        for (final String line : lines) {
++            sender.sendMessage(text("  " + line, WHITE));
++        }
++    }
++
++    @Override
++    public List<String> tabComplete(final CommandSender sender, final String subCommand, final String[] args) {
++        return args.length <= 1 ? Completions.matchingLast(args, ACTIONS) : Collections.emptyList();
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+index 4e4b36d64db58bc376ca25f658cd29cd903a70d8..80072812a69c81776471974b03fc33eb831a56d7 100644
+--- a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -48,6 +48,7 @@ public final class StatusCommand extends PermissionedKodamaSubcommand {
+             });
+         }
+         dev.kodama.chunk.ChunkLoadingStatus.register();
++        dev.kodama.chunk.precache.PrecacheStatus.register();
+     }
+ 
+     public StatusCommand() {
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index 8fea27f163f07067dd94e1a2515b8b8ef97a3762..f0ffbc2f6d0748d66ba3f2bb142a4103c098f2f3 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -4,6 +4,8 @@ import io.papermc.paper.configuration.Configuration;
+ import io.papermc.paper.configuration.ConfigurationPart;
+ import io.papermc.paper.configuration.constraint.Constraint;
+ import io.papermc.paper.configuration.constraint.Constraints;
++import java.util.ArrayList;
++import java.util.List;
+ import org.spongepowered.configurate.objectmapping.meta.Comment;
+ import org.spongepowered.configurate.objectmapping.meta.Setting;
+ 
+@@ -153,11 +155,41 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+         }
+     }
+ 
+-    @Comment("Background pre-caching of chunk data.")
++    @Comment("Background pre-generation of chunks that do not exist yet. Chunks are generated at the lowest priority, saved and unloaded again at once.")
+     public Precache precache;
+ 
+     public class Precache extends ConfigurationPart {
+-        @Comment("Enables pre-caching.")
++        @Comment("Enables pre-generation. Needs spare server time: it pauses while the server is slow or players are waiting for chunks.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++        @Comment("Worlds that are pre-generated, by name. 'world' stands for the main overworld (the level-name of server.properties). An empty list selects every loaded world.")
++        public List<String> worlds = new ArrayList<>(List.of("world"));
++
++        @Comment("Pre-generation stops while the average tick time of the last second is above this many milliseconds.")
++        @Constraint(Constraints.Positive.class)
++        public double maxMspt = 35.0;
++
++        @Comment("Maximum number of chunks that are generated at the same time while players are online.")
++        @Constraints.Min(1)
++        public int maxConcurrent = 8;
++
++        @Comment("Maximum number of chunks that are generated at the same time while nobody is online.")
++        @Constraints.Min(1)
++        public int maxConcurrentIdle = 32;
++
++        @Comment("Radius, in blocks, around the world spawn up to which chunks are generated. A smaller world border wins.")
++        @Constraints.Min(16)
++        public int maxRadius = 5000;
++
++        @Comment("Pre-generation stops while the region folder of a world is larger than this many megabytes. Checked once per minute.")
++        @Constraints.Min(1)
++        public long maxDiskMb = 4096;
++
++        @Comment("Players who discover at least this many new chunks per minute are treated as explorers: the area ahead of them is generated with priority.")
++        @Constraint(Constraints.Positive.class)
++        public double explorerNewChunksPerMinute = 30.0;
++
++        @Comment("Whether the Bukkit ChunkLoadEvent is fired for chunks that were generated by pre-generation. Plugins that decorate new chunks rely on it, so only turn this off when you know they do not.")
++        public boolean fireChunkLoadEvent = true;
+     }
+ }
+diff --git a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+index ba6693336469d8a19eedf3826f0584e99021c41e..5e68274d2ca2c37458df1129631b62ff4397b52f 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
++++ b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+@@ -1079,6 +1079,15 @@ public class RegionizedPlayerChunkLoader {
+         }
+         // Kodama end - chunk-priority, chunk-prefetch
+ 
++        // Kodama start - precache
++        /**
++         * Number of chunks this player currently waits for (queued to load, queued to generate or generating). Cheap, main thread only.
++         */
++        public int kodamaPendingWork() {
++            return this.loadingQueue.size() + this.genQueue.size() + this.generatingQueue.size();
++        }
++        // Kodama end - precache
++
+         void remove() {
+             TickThread.ensureTickThread(this.player, "Cannot add player asynchronously");
+             if (this.removed) {
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 655ac260dcdb08e8d32fbed9e3c8b75f480b06c0..e8034ec57a10f2d1802f2a6781473f80da0122ef 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -1005,6 +1005,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             }
+         }
+ 
++        dev.kodama.chunk.precache.PrecacheManager.shutdown(); // Kodama - precache
+         this.saveAllChunks(false, true, false, true); // Paper - rewrite chunk system - move closing into here
+ 
+         this.isSaving = false;
+@@ -1626,6 +1627,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.tickTimes60s.add(this.tickCount, j);
+         // Paper end - Add tick times API and /mspt command
+         this.logTickMethodTime(i);
++        dev.kodama.chunk.precache.PrecacheManager.tick(this); // Kodama - precache
+         this.profiler.pop();
+         org.spigotmc.WatchdogThread.tick(); // Spigot
+         co.aikar.timings.TimingsManager.FULL_SERVER_TICK.stopTiming(); // Paper
+diff --git a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+index f678a85ec7de5eeb499d27dd03e9ee1952cea355..2b0cea0be37c53a2418ea3625a50896e8e98de42 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -806,7 +806,11 @@ public class LevelChunk extends ChunkAccess {
+              * no way of creating a CraftWorld/CraftServer at that point.
+              */
+             org.bukkit.Chunk bukkitChunk = new org.bukkit.craftbukkit.CraftChunk(this);
++            // Kodama start - precache
++            if (!dev.kodama.chunk.precache.PrecacheManager.suppressChunkLoadEvent(this.level, this.chunkPos.x, this.chunkPos.z)) {
+             server.getPluginManager().callEvent(new org.bukkit.event.world.ChunkLoadEvent(bukkitChunk, this.needsDecoration));
++            }
++            // Kodama end - precache
+             this.chunkHolder.getEntityChunk().callEntitiesLoadEvent(); // Paper - rewrite chunk system
+ 
+             if (this.needsDecoration) {
