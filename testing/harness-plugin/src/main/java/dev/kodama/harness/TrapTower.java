@@ -4,6 +4,8 @@ import org.bukkit.GameRule;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.block.Block;
+import org.bukkit.block.data.type.TrapDoor;
 import org.bukkit.WorldCreator;
 import org.bukkit.generator.ChunkGenerator;
 import org.bukkit.entity.Player;
@@ -55,7 +57,16 @@ final class TrapTower {
         for (int x = -FLOOR_RADIUS; x <= FLOOR_RADIUS; x++) {
             for (int z = -FLOOR_RADIUS; z <= FLOOR_RADIUS; z++) {
                 boolean hole = x % 4 == 0 && z % 4 == 0;
-                world.getBlockAt(cx + x, FLOOR_Y, cz + z).setType(hole ? Material.AIR : Material.STONE, false);
+                Block block = world.getBlockAt(cx + x, FLOOR_Y, cz + z);
+                if (hole) {
+                    // Mobs path around plain holes but walk onto open trapdoors as if they were floor.
+                    block.setType(Material.OAK_TRAPDOOR, false);
+                    TrapDoor trapdoor = (TrapDoor) block.getBlockData();
+                    trapdoor.setOpen(true);
+                    block.setBlockData(trapdoor, false);
+                } else {
+                    block.setType(Material.STONE, false);
+                }
             }
         }
         int sx = cx + STAND_OFFSET_X;
