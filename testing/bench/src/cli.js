@@ -21,11 +21,13 @@ bench options:
   --bots <n>                 (10)
   --pattern settler|explorer|mixed|afk (mixed); afk bots stand still
   --tower                    Build a trap tower above spawn, night locked, and park the bots next to it
+  --slow-tick-ms <ms>        Sample main thread stacks during ticks longer than this (100)
   --duration <s>             Measured seconds (120)
   --warmup <s>               (30)
   --seed <string>            World seed (kodama)
   --pregen-radius <chunks>   Radius of the cached pre-generated world (24)
-  --kodama-set key=value     Kodama global config override (repeatable), e.g. chunk-loading.prefetch.enabled=false
+  --kodama-set key=value     Kodama config override (repeatable), e.g. chunk-loading.prefetch.enabled=false;
+                             prefix world. for world defaults, e.g. world.mob-lod.enabled=false
   --explorer-speed <b/s>     Explorer bot speed in blocks/s (30)
   --server-cpus <list>       Server CPU pinning (0-7)
   --bot-cpus <list>          Bot swarm CPU pinning (8-11)
@@ -62,6 +64,7 @@ const options = {
   'kodama-set': { type: 'string', multiple: true },
   'explorer-speed': { type: 'string', default: '30' },
   tower: { type: 'boolean' },
+  'slow-tick-ms': { type: 'string', default: '100' },
   'server-cpus': { type: 'string', default: '0-7' },
   'bot-cpus': { type: 'string', default: '8-11' },
   'no-affinity': { type: 'boolean' },
@@ -117,6 +120,7 @@ async function main() {
       kodamaSet: values['kodama-set'] ?? [],
       explorerSpeed: number(values, 'explorer-speed', { min: 0, integer: false }),
       tower: Boolean(values.tower),
+      slowTickMs: number(values, 'slow-tick-ms', { min: 1 }),
       serverCpus: values['server-cpus'],
       botCpus: values['bot-cpus'],
       noAffinity: Boolean(values['no-affinity']),

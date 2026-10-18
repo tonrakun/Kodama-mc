@@ -52,8 +52,12 @@ export function prepareServerDir(dir, o) {
   );
   writeFileSync(join(dir, 'spigot.yml'), 'settings:\n  moved-too-quickly-multiplier: 1000.0\n  moved-wrongly-threshold: 1000.0\n');
   if (o.flavor === 'kodama' && o.kodamaSettings?.length) {
+    // "world.<key>=value" goes to the world defaults file, everything else to the global file
+    const world = o.kodamaSettings.filter((s) => s.startsWith('world.')).map((s) => s.slice('world.'.length));
+    const global = o.kodamaSettings.filter((s) => !s.startsWith('world.'));
     mkdirSync(join(dir, 'config'), { recursive: true });
-    writeFileSync(join(dir, 'config', 'kodama-global.yml'), toNestedYaml(o.kodamaSettings));
+    if (global.length) writeFileSync(join(dir, 'config', 'kodama-global.yml'), toNestedYaml(global));
+    if (world.length) writeFileSync(join(dir, 'config', 'kodama-world-defaults.yml'), toNestedYaml(world));
   }
   if (o.deterministic) {
     // Features spill into neighbour chunks, so the result depends on generation order; one worker makes it fixed.

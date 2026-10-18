@@ -175,7 +175,7 @@ final class MetricsRecorder implements Listener {
         nextHeapSampleNanos = windowStartNanos;
         allocStart = threadAllocated();
         registerGcListeners();
-        sampler = new SlowTickSampler(Thread.currentThread(), 100);
+        sampler = new SlowTickSampler(Thread.currentThread(), Long.getLong("kodama.harness.slowTickMs", 100));
         sampler.start();
         recording = true;
         plugin.getLogger().info("Metrics: recording started"
