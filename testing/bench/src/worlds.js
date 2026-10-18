@@ -6,12 +6,13 @@ import { copyWorld, removeDir } from './server.js';
 import { safeName } from './util.js';
 
 export function worldCacheDir(seed, radius) {
-  return join(CACHE, 'worlds', `${safeName(seed)}-r${radius}`);
+  return join(CACHE, 'worlds', `${safeName(seed)}-r${radius}-overworld`);
 }
 
 /**
  * Pre-generates the shared test world with Paper once and caches it, so both servers
  * start from identical chunks (fixed seed + pre-generated world).
+ * Only the overworld is pre-generated: the bots never leave it.
  */
 export async function ensurePregenWorld({ seed, radius, env }) {
   const cacheDir = worldCacheDir(seed, radius);
@@ -21,7 +22,7 @@ export async function ensurePregenWorld({ seed, radius, env }) {
   }
   const dir = join(WORK, `worldgen-${safeName(seed)}-r${radius}`);
   removeDir(dir);
-  const out = await runPregen({ flavor: 'paper', dir, seed, radius, env, label: 'worldgen' });
+  const out = await runPregen({ flavor: 'paper', dir, seed, radius, worlds: [WORLD_NAMES.overworld], env, label: 'worldgen' });
 
   const staging = `${cacheDir}.tmp`;
   removeDir(staging);
