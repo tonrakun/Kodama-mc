@@ -1,0 +1,1240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 15:01:49 +0900
+Subject: [PATCH] Kodama commands
+
+License: GPL-3.0 (https://www.gnu.org/licenses/gpl-3.0.html)
+
+Based on "Gale commands" from Gale (https://github.com/Dreeam-qwq/Gale), GPL-3.0,
+itself based on "Paper command" from Paper (MIT).
+
+Adds /kodama with the reload, version, status and config (get, set, undo)
+subcommands, tab completion, per-option view/edit permissions, the
+kodama permissions root and the config change log.
+
+diff --git a/src/main/java/dev/kodama/command/Completions.java b/src/main/java/dev/kodama/command/Completions.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6530d512bc7f7828deb5ff68184558a17ee86fb
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/Completions.java
+@@ -0,0 +1,25 @@
++package dev.kodama.command;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++
++public final class Completions {
++
++    private Completions() {
++    }
++
++    /**
++     * Case-insensitive prefix match against the argument being typed (the last one).
++     */
++    public static List<String> matchingLast(final String[] args, final Collection<String> candidates) {
++        final String last = args.length == 0 ? "" : args[args.length - 1];
++        final List<String> result = new ArrayList<>();
++        for (final String candidate : candidates) {
++            if (candidate.regionMatches(true, 0, last, 0, last.length())) {
++                result.add(candidate);
++            }
++        }
++        return result;
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/KodamaCommand.java b/src/main/java/dev/kodama/command/KodamaCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4459e22b4abbc654ac56b35647e6441f0b03f6a
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/KodamaCommand.java
+@@ -0,0 +1,112 @@
++package dev.kodama.command;
++
++import dev.kodama.command.subcommands.ConfigCommand;
++import dev.kodama.command.subcommands.ReloadCommand;
++import dev.kodama.command.subcommands.StatusCommand;
++import dev.kodama.command.subcommands.VersionCommand;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import net.kyori.adventure.text.Component;
++import org.bukkit.Bukkit;
++import org.bukkit.Location;
++import org.bukkit.command.Command;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.Permission;
++import org.bukkit.permissions.PermissionDefault;
++import org.bukkit.plugin.PluginManager;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++
++@DefaultQualifier(NonNull.class)
++public final class KodamaCommand extends Command {
++    public static final String COMMAND_LABEL = "kodama";
++    public static final String BASE_PERM = KodamaCommands.COMMAND_BASE_PERM + "." + COMMAND_LABEL;
++    private static final Permission BASE_PERMISSION = new Permission(BASE_PERM, "Allows using /kodama", PermissionDefault.TRUE);
++
++    // subcommand label -> subcommand, in the order they are listed in the usage message
++    private static final Map<String, KodamaSubcommand> SUBCOMMANDS = new LinkedHashMap<>();
++    static {
++        SUBCOMMANDS.put(ReloadCommand.LITERAL_ARGUMENT, new ReloadCommand());
++        SUBCOMMANDS.put(StatusCommand.LITERAL_ARGUMENT, new StatusCommand());
++        SUBCOMMANDS.put(VersionCommand.LITERAL_ARGUMENT, new VersionCommand());
++        SUBCOMMANDS.put(ConfigCommand.LITERAL_ARGUMENT, new ConfigCommand());
++    }
++
++    public KodamaCommand() {
++        super(COMMAND_LABEL);
++        this.description = "Kodama related commands";
++        this.usageMessage = createUsageMessage(SUBCOMMANDS.keySet());
++        this.setPermission(BASE_PERM);
++        final PluginManager pluginManager = Bukkit.getServer().getPluginManager();
++        pluginManager.addPermission(BASE_PERMISSION);
++        for (final KodamaSubcommand subcommand : SUBCOMMANDS.values()) {
++            for (final Permission permission : subcommand.permissions()) {
++                pluginManager.addPermission(permission);
++            }
++        }
++    }
++
++    private static String createUsageMessage(final Iterable<String> arguments) {
++        return "/" + COMMAND_LABEL + " [" + String.join(" | ", arguments) + "]";
++    }
++
++    private static List<String> usableSubcommands(final CommandSender sender) {
++        final List<String> usable = new ArrayList<>(SUBCOMMANDS.size());
++        for (final Map.Entry<String, KodamaSubcommand> entry : SUBCOMMANDS.entrySet()) {
++            if (entry.getValue().testPermission(sender)) {
++                usable.add(entry.getKey());
++            }
++        }
++        return usable;
++    }
++
++    @Override
++    public List<String> tabComplete(final CommandSender sender, final String alias, final String[] args, final @Nullable Location location) throws IllegalArgumentException {
++        if (!sender.hasPermission(BASE_PERMISSION)) {
++            return Collections.emptyList();
++        }
++        if (args.length <= 1) {
++            return Completions.matchingLast(args, usableSubcommands(sender));
++        }
++        final @Nullable KodamaSubcommand subcommand = SUBCOMMANDS.get(args[0].toLowerCase(Locale.ENGLISH));
++        if (subcommand != null && subcommand.testPermission(sender)) {
++            return subcommand.tabComplete(sender, args[0].toLowerCase(Locale.ENGLISH), Arrays.copyOfRange(args, 1, args.length));
++        }
++        return Collections.emptyList();
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String commandLabel, final String[] args) {
++        if (!sender.hasPermission(BASE_PERMISSION)) {
++            sender.sendMessage(Bukkit.permissionMessage());
++            return true;
++        }
++
++        final List<String> usable = usableSubcommands(sender);
++        final String usage = createUsageMessage(usable);
++
++        if (args.length == 0) {
++            sender.sendMessage(text("Kodama is a performance-focused Paper fork.", GRAY));
++            sender.sendMessage(text(usable.isEmpty() ? "You do not have permission for any /kodama subcommand." : "Command usage: " + usage, GRAY));
++            return true;
++        }
++
++        final String label = args[0].toLowerCase(Locale.ENGLISH);
++        final @Nullable KodamaSubcommand subcommand = SUBCOMMANDS.get(label);
++        if (subcommand == null || !subcommand.testPermission(sender)) {
++            sender.sendMessage(Component.text("Usage: " + usage, RED));
++            return false;
++        }
++        return subcommand.execute(sender, label, Arrays.copyOfRange(args, 1, args.length));
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/KodamaCommands.java b/src/main/java/dev/kodama/command/KodamaCommands.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d09cdfd7d343a0c967f9f4052cd76afa03e92d52
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/KodamaCommands.java
+@@ -0,0 +1,29 @@
++package dev.kodama.command;
++
++import java.util.HashMap;
++import java.util.Map;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.command.Command;
++import org.bukkit.craftbukkit.util.permissions.CraftDefaultPermissions;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++@DefaultQualifier(NonNull.class)
++public final class KodamaCommands {
++
++    public static final String COMMAND_BASE_PERM = CraftDefaultPermissions.KODAMA_ROOT + ".command";
++
++    private KodamaCommands() {
++    }
++
++    private static final Map<String, Command> COMMANDS = new HashMap<>();
++    static {
++        COMMANDS.put(KodamaCommand.COMMAND_LABEL, new KodamaCommand());
++    }
++
++    public static void registerCommands(final MinecraftServer server) {
++        COMMANDS.forEach((s, command) -> {
++            server.server.getCommandMap().register(s, "Kodama", command);
++        });
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/KodamaSubcommand.java b/src/main/java/dev/kodama/command/KodamaSubcommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a91db94e3ab941d6a534680faabf4ae9263a568
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/KodamaSubcommand.java
+@@ -0,0 +1,28 @@
++package dev.kodama.command;
++
++import java.util.Collections;
++import java.util.List;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.Permission;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++@DefaultQualifier(NonNull.class)
++public interface KodamaSubcommand {
++
++    boolean execute(CommandSender sender, String subCommand, String[] args);
++
++    default List<String> tabComplete(final CommandSender sender, final String subCommand, final String[] args) {
++        return Collections.emptyList();
++    }
++
++    /**
++     * Whether the sender may use this subcommand at all (it is hidden from usage and completion otherwise).
++     */
++    boolean testPermission(CommandSender sender);
++
++    /**
++     * Permissions to register with the server when the command is created.
++     */
++    List<Permission> permissions();
++}
+diff --git a/src/main/java/dev/kodama/command/PermissionedKodamaSubcommand.java b/src/main/java/dev/kodama/command/PermissionedKodamaSubcommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..828fb48c384d94e748d074749df0edc98b35f562
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/PermissionedKodamaSubcommand.java
+@@ -0,0 +1,25 @@
++package dev.kodama.command;
++
++import java.util.List;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.Permission;
++import org.bukkit.permissions.PermissionDefault;
++
++public abstract class PermissionedKodamaSubcommand implements KodamaSubcommand {
++
++    public final Permission permission;
++
++    protected PermissionedKodamaSubcommand(final String permission, final PermissionDefault permissionDefault) {
++        this.permission = new Permission(permission, permissionDefault);
++    }
++
++    @Override
++    public boolean testPermission(final CommandSender sender) {
++        return sender.hasPermission(this.permission);
++    }
++
++    @Override
++    public List<Permission> permissions() {
++        return List.of(this.permission);
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/StatusContributor.java b/src/main/java/dev/kodama/command/StatusContributor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..27366a6c00122e926cb44009afbe78a265b35148
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/StatusContributor.java
+@@ -0,0 +1,15 @@
++package dev.kodama.command;
++
++import net.kyori.adventure.text.Component;
++
++/**
++ * A line in {@code /kodama status}, supplied by a feature. Register it with
++ * {@link dev.kodama.command.subcommands.StatusCommand#register(StatusContributor)}; a contributor with the same label
++ * replaces the placeholder that is shown until the feature exists.
++ */
++public interface StatusContributor {
++
++    String label();
++
++    Component describe();
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java b/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8bc6e11df7317152b7e2efb29fa537bf431c2802
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java
+@@ -0,0 +1,397 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.command.Completions;
++import dev.kodama.command.KodamaSubcommand;
++import dev.kodama.config.ConfigEditor;
++import dev.kodama.config.ConfigReloadException;
++import dev.kodama.config.ConfigSchema;
++import dev.kodama.config.ConfigTarget;
++import dev.kodama.config.ReloadClass;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++import net.kyori.adventure.text.Component;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.Bukkit;
++import org.bukkit.World;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.Permission;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++import static net.kyori.adventure.text.format.NamedTextColor.YELLOW;
++
++/**
++ * {@code /kodama config get|set|undo}. Viewing needs {@code kodama.config.view} or {@code kodama.config.view.<path>},
++ * editing {@code kodama.config.edit} or {@code kodama.config.edit.<path>}.
++ */
++@DefaultQualifier(NonNull.class)
++public final class ConfigCommand implements KodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "config";
++    public static final String VIEW_PERM = "kodama.config.view";
++    public static final String EDIT_PERM = "kodama.config.edit";
++
++    private static final String GET_USAGE = "/kodama config get <path> [world]";
++    private static final String SET_USAGE = "/kodama config set <path> <value> [world]";
++    private static final String UNDO_USAGE = "/kodama config undo";
++
++    private static final List<ConfigSchema.Option> ALL_OPTIONS = allOptions();
++
++    private static List<ConfigSchema.Option> allOptions() {
++        final List<ConfigSchema.Option> all = new ArrayList<>(ConfigSchema.GLOBAL.options());
++        all.addAll(ConfigSchema.WORLD.options());
++        return all;
++    }
++
++    // permissions
++
++    @Override
++    public List<Permission> permissions() {
++        final List<Permission> permissions = new ArrayList<>();
++        permissions.add(new Permission(VIEW_PERM, "Allows reading every Kodama config option", PermissionDefault.OP));
++        permissions.add(new Permission(EDIT_PERM, "Allows changing every Kodama config option", PermissionDefault.OP));
++        for (final ConfigSchema.Option option : ALL_OPTIONS) {
++            permissions.add(new Permission(VIEW_PERM + "." + option.path(), "Allows reading " + option.path(), PermissionDefault.FALSE));
++            permissions.add(new Permission(EDIT_PERM + "." + option.path(), "Allows changing " + option.path(), PermissionDefault.FALSE));
++        }
++        return permissions;
++    }
++
++    private static boolean canView(final CommandSender sender, final ConfigSchema.Option option) {
++        return sender.hasPermission(VIEW_PERM) || sender.hasPermission(VIEW_PERM + "." + option.path());
++    }
++
++    private static boolean canEdit(final CommandSender sender, final ConfigSchema.Option option) {
++        return sender.hasPermission(EDIT_PERM) || sender.hasPermission(EDIT_PERM + "." + option.path());
++    }
++
++    private static boolean canViewAny(final CommandSender sender) {
++        if (sender.hasPermission(VIEW_PERM)) {
++            return true;
++        }
++        for (final ConfigSchema.Option option : ALL_OPTIONS) {
++            if (canView(sender, option)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private static boolean canEditAny(final CommandSender sender) {
++        if (sender.hasPermission(EDIT_PERM)) {
++            return true;
++        }
++        for (final ConfigSchema.Option option : ALL_OPTIONS) {
++            if (canEdit(sender, option)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    @Override
++    public boolean testPermission(final CommandSender sender) {
++        return canViewAny(sender) || canEditAny(sender);
++    }
++
++    // execution
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length == 0) {
++            sendUsage(sender);
++            return false;
++        }
++        final String[] rest = Arrays.copyOfRange(args, 1, args.length);
++        switch (args[0].toLowerCase(Locale.ROOT)) {
++            case "get" -> {
++                return this.get(sender, rest);
++            }
++            case "set" -> {
++                return this.set(sender, rest);
++            }
++            case "undo" -> {
++                return this.undo(sender, rest);
++            }
++            default -> {
++                sendUsage(sender);
++                return false;
++            }
++        }
++    }
++
++    private static void sendUsage(final CommandSender sender) {
++        sender.sendMessage(text("Usage:", RED));
++        if (canViewAny(sender)) {
++            sender.sendMessage(text("  " + GET_USAGE, RED));
++        }
++        if (canEditAny(sender)) {
++            sender.sendMessage(text("  " + SET_USAGE, RED));
++            sender.sendMessage(text("  " + UNDO_USAGE, RED));
++        }
++    }
++
++    private static void noPermission(final CommandSender sender) {
++        sender.sendMessage(Bukkit.permissionMessage());
++    }
++
++    private static void error(final CommandSender sender, final String message) {
++        sender.sendMessage(text(message, RED));
++    }
++
++    private boolean get(final CommandSender sender, final String[] args) {
++        if (!canViewAny(sender)) {
++            noPermission(sender);
++            return true;
++        }
++        if (args.length < 1 || args.length > 2) {
++            error(sender, "Usage: " + GET_USAGE);
++            return false;
++        }
++        final String path = args[0].toLowerCase(Locale.ROOT);
++        final List<ConfigSchema.Option> globalMatches = ConfigSchema.GLOBAL.under(path);
++        final List<ConfigSchema.Option> worldMatches = ConfigSchema.WORLD.under(path);
++        if (globalMatches.isEmpty() && worldMatches.isEmpty()) {
++            error(sender, "Unknown config option '" + args[0] + "'. Use tab completion to list the options.");
++            return false;
++        }
++        final @Nullable ConfigTarget target = this.resolveTarget(sender, !globalMatches.isEmpty(), path, args.length == 2 ? args[1] : null);
++        if (target == null) {
++            return false;
++        }
++        final List<ConfigSchema.Option> visible = new ArrayList<>();
++        for (final ConfigSchema.Option option : globalMatches.isEmpty() ? worldMatches : globalMatches) {
++            if (canView(sender, option)) {
++                visible.add(option);
++            }
++        }
++        if (visible.isEmpty()) {
++            noPermission(sender);
++            return true;
++        }
++
++        final MinecraftServer server = MinecraftServer.getServer();
++        final String where = switch (target.scope()) {
++            case GLOBAL -> "global";
++            case WORLD_DEFAULTS -> "world defaults";
++            case WORLD -> "world " + target.worldName();
++        };
++        for (final ConfigSchema.Option option : visible) {
++            try {
++                final String value = ConfigEditor.display(server.kodamaConfigurations.currentValue(server, target, option));
++                sender.sendMessage(text(option.path(), YELLOW).append(text(" = ", GRAY)).append(text(value, WHITE))
++                    .append(text("  [" + where + ", " + option.reloadClass().label() + "]", GRAY)));
++                if (visible.size() == 1 && option.comment() != null) {
++                    sender.sendMessage(text(option.comment(), GRAY));
++                }
++            } catch (final ConfigReloadException exception) {
++                error(sender, exception.getMessage() == null ? "Could not read " + option.path() : exception.getMessage());
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private boolean set(final CommandSender sender, final String[] args) {
++        if (!canEditAny(sender)) {
++            noPermission(sender);
++            return true;
++        }
++        if (args.length < 2 || args.length > 3) {
++            error(sender, "Usage: " + SET_USAGE);
++            return false;
++        }
++        final String path = args[0].toLowerCase(Locale.ROOT);
++        final ConfigSchema.@Nullable Option globalOption = ConfigSchema.GLOBAL.find(path);
++        final ConfigSchema.@Nullable Option option = globalOption != null ? globalOption : ConfigSchema.WORLD.find(path);
++        if (option == null) {
++            error(sender, !ConfigSchema.GLOBAL.under(path).isEmpty() || !ConfigSchema.WORLD.under(path).isEmpty()
++                ? "'" + args[0] + "' is a section; set one of its options instead."
++                : "Unknown config option '" + args[0] + "'. Use tab completion to list the options.");
++            return false;
++        }
++        if (!canEdit(sender, option)) {
++            noPermission(sender);
++            return true;
++        }
++        final @Nullable ConfigTarget target = this.resolveTarget(sender, globalOption != null, path, args.length == 3 ? args[2] : null);
++        if (target == null) {
++            return false;
++        }
++
++        final ConfigEditor.Result result;
++        try {
++            result = ConfigEditor.set(sender, target, option, args[1]);
++        } catch (final IllegalArgumentException exception) {
++            error(sender, "Not changed: " + exception.getMessage());
++            return false;
++        } catch (final ConfigReloadException exception) {
++            error(sender, "Not changed, the value is not valid: " + exception.getMessage());
++            return false;
++        }
++        this.reportChange(sender, result, "Set ");
++        return true;
++    }
++
++    private boolean undo(final CommandSender sender, final String[] args) {
++        if (!canEditAny(sender)) {
++            noPermission(sender);
++            return true;
++        }
++        if (args.length != 0) {
++            error(sender, "Usage: " + UNDO_USAGE);
++            return false;
++        }
++        final ConfigSchema.@Nullable Option last = ConfigEditor.peekUndoOption(sender);
++        if (last == null) {
++            error(sender, "There is nothing to undo.");
++            return false;
++        }
++        if (!canEdit(sender, last)) {
++            noPermission(sender);
++            return true;
++        }
++        final ConfigEditor.Result result;
++        try {
++            result = ConfigEditor.undo(sender);
++        } catch (final IllegalStateException exception) {
++            error(sender, exception.getMessage());
++            return false;
++        } catch (final ConfigReloadException exception) {
++            error(sender, "Not reverted: " + exception.getMessage());
++            return false;
++        }
++        this.reportChange(sender, result, "Reverted ");
++        return true;
++    }
++
++    private void reportChange(final CommandSender sender, final ConfigEditor.Result result, final String verb) {
++        final String path = result.option().path();
++        if (result.unchanged()) {
++            sender.sendMessage(text(path + " is already " + result.newDisplay() + ".", YELLOW));
++            return;
++        }
++        sender.sendMessage(text(verb + path + " in " + result.target().fileName() + ": ", GREEN)
++            .append(text(result.oldDisplay(), WHITE)).append(text(" -> ", GRAY)).append(text(result.newDisplay(), WHITE)));
++        sender.sendMessage(text("Reload timing: " + result.option().reloadClass().label(), GRAY));
++        if (result.option().reloadClass() == ReloadClass.RESTART_REQUIRED) {
++            sender.sendMessage(text(path + ": changed, takes effect after restart", YELLOW));
++        } else if (result.option().reloadClass() == ReloadClass.STAGED) {
++            sender.sendMessage(text(path + ": applied gradually over the next ticks", YELLOW));
++        }
++    }
++
++    /**
++     * Picks the file an option lives in. Reports an error and returns {@code null} when the world argument does not
++     * fit the option.
++     */
++    private @Nullable ConfigTarget resolveTarget(final CommandSender sender, final boolean globalOption, final String path, final @Nullable String worldArgument) {
++        if (globalOption) {
++            if (worldArgument != null) {
++                error(sender, "'" + path + "' is a global option and has no per-world value.");
++                return null;
++            }
++            return ConfigTarget.GLOBAL;
++        }
++        if (worldArgument == null) {
++            return ConfigTarget.WORLD_DEFAULTS;
++        }
++        final @Nullable World world = Bukkit.getWorld(worldArgument);
++        if (world == null) {
++            error(sender, "Unknown world '" + worldArgument + "'.");
++            return null;
++        }
++        return ConfigTarget.world(world.getName());
++    }
++
++    // tab completion
++
++    @Override
++    public List<String> tabComplete(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length <= 1) {
++            final List<String> subs = new ArrayList<>();
++            if (canViewAny(sender)) {
++                subs.add("get");
++            }
++            if (canEditAny(sender)) {
++                subs.add("set");
++                subs.add("undo");
++            }
++            return Completions.matchingLast(args, subs);
++        }
++        final String sub = args[0].toLowerCase(Locale.ROOT);
++        if (sub.equals("get") && canViewAny(sender)) {
++            if (args.length == 2) {
++                return Completions.matchingLast(args, this.pathCandidates(sender, true));
++            }
++            if (args.length == 3) {
++                return this.worldCandidates(args, args[1]);
++            }
++        } else if (sub.equals("set") && canEditAny(sender)) {
++            if (args.length == 2) {
++                return Completions.matchingLast(args, this.pathCandidates(sender, false));
++            }
++            final ConfigSchema.@Nullable Option option = this.findOption(args[1]);
++            if (option == null) {
++                return Collections.emptyList();
++            }
++            if (args.length == 3) {
++                return Completions.matchingLast(args, ConfigEditor.valueSuggestions(option));
++            }
++            if (args.length == 4) {
++                return this.worldCandidates(args, args[1]);
++            }
++        }
++        return Collections.emptyList();
++    }
++
++    private ConfigSchema.@Nullable Option findOption(final String path) {
++        final String lower = path.toLowerCase(Locale.ROOT);
++        final ConfigSchema.@Nullable Option option = ConfigSchema.GLOBAL.find(lower);
++        return option != null ? option : ConfigSchema.WORLD.find(lower);
++    }
++
++    private List<String> worldCandidates(final String[] args, final String path) {
++        if (ConfigSchema.WORLD.under(path.toLowerCase(Locale.ROOT)).isEmpty()) {
++            return Collections.emptyList();
++        }
++        final List<String> worlds = new ArrayList<>();
++        for (final World world : Bukkit.getWorlds()) {
++            worlds.add(world.getName());
++        }
++        return Completions.matchingLast(args, worlds);
++    }
++
++    /**
++     * Option paths the sender may use; with {@code includeSections} also the section prefixes, for {@code get}.
++     */
++    private Set<String> pathCandidates(final CommandSender sender, final boolean includeSections) {
++        final Set<String> candidates = new LinkedHashSet<>();
++        for (final ConfigSchema.Option option : ALL_OPTIONS) {
++            if (!(includeSections ? canView(sender, option) : canEdit(sender, option))) {
++                continue;
++            }
++            if (includeSections) {
++                int dot = option.path().indexOf('.');
++                while (dot >= 0) {
++                    candidates.add(option.path().substring(0, dot));
++                    dot = option.path().indexOf('.', dot + 1);
++                }
++            }
++            candidates.add(option.path());
++        }
++        return candidates;
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/ReloadCommand.java b/src/main/java/dev/kodama/command/subcommands/ReloadCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..809bc64df91ba514f6cc660e5eb61894dfcc2efa
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/ReloadCommand.java
+@@ -0,0 +1,57 @@
++package dev.kodama.command.subcommands;
++
++import com.mojang.logging.LogUtils;
++import dev.kodama.command.KodamaCommands;
++import dev.kodama.command.PermissionedKodamaSubcommand;
++import dev.kodama.config.ConfigReloadException;
++import dev.kodama.config.KodamaConfigurations;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++import org.slf4j.Logger;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.YELLOW;
++
++@DefaultQualifier(NonNull.class)
++public final class ReloadCommand extends PermissionedKodamaSubcommand {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++    public static final String LITERAL_ARGUMENT = "reload";
++    public static final String PERM = KodamaCommands.COMMAND_BASE_PERM + "." + LITERAL_ARGUMENT;
++
++    public ReloadCommand() {
++        super(PERM, PermissionDefault.OP);
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        final MinecraftServer server = MinecraftServer.getServer();
++        // Config objects are swapped on the main thread, between two ticks.
++        if (server.isSameThread()) {
++            this.doReload(server, sender);
++        } else {
++            server.execute(() -> this.doReload(server, sender));
++        }
++        return true;
++    }
++
++    private void doReload(final MinecraftServer server, final CommandSender sender) {
++        try {
++            final KodamaConfigurations.ReloadReport report = server.kodamaConfigurations.reloadAll(server, true);
++            LOGGER.info("Kodama configuration reloaded by {}", sender.getName());
++            sender.sendMessage(text("Kodama configuration reloaded. Features that were disabled after repeated errors are enabled again.", GREEN));
++            for (final String pending : report.pendingRestart()) {
++                sender.sendMessage(text(pending + ": changed, takes effect after restart", YELLOW));
++            }
++        } catch (final ConfigReloadException exception) {
++            LOGGER.error("Kodama configuration reload by {} failed, keeping the previous configuration: {}", sender.getName(), exception.getMessage());
++            sender.sendMessage(text("Reload failed, the previous configuration is still active.", RED));
++            sender.sendMessage(text(exception.getMessage() == null ? "Unknown error" : exception.getMessage(), RED));
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c0045dba78caee11724eaef9aa1ff7048189daeb
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -0,0 +1,121 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.command.KodamaCommands;
++import dev.kodama.command.PermissionedKodamaSubcommand;
++import dev.kodama.command.StatusContributor;
++import dev.kodama.config.ConfigSchema;
++import dev.kodama.config.KodamaGlobalConfiguration;
++import dev.kodama.config.PresetBoolean;
++import dev.kodama.feature.FeatureGuard;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.CopyOnWriteArrayList;
++import net.kyori.adventure.text.Component;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++import static net.kyori.adventure.text.format.NamedTextColor.YELLOW;
++
++@DefaultQualifier(NonNull.class)
++public final class StatusCommand extends PermissionedKodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "status";
++    public static final String PERM = KodamaCommands.COMMAND_BASE_PERM + "." + LITERAL_ARGUMENT;
++
++    private static final List<StatusContributor> CONTRIBUTORS = new CopyOnWriteArrayList<>();
++    static {
++        // Placeholders until the features that fill them exist.
++        for (final String label : List.of("Mob tiers", "Player types", "Precache progress")) {
++            CONTRIBUTORS.add(new StatusContributor() {
++                @Override
++                public String label() {
++                    return label;
++                }
++
++                @Override
++                public Component describe() {
++                    return text("n/a", GRAY);
++                }
++            });
++        }
++    }
++
++    public StatusCommand() {
++        super(PERM, PermissionDefault.OP);
++    }
++
++    /**
++     * Adds a status line, or replaces the line with the same label (keeping its position).
++     */
++    public static void register(final StatusContributor contributor) {
++        for (int i = 0; i < CONTRIBUTORS.size(); i++) {
++            if (CONTRIBUTORS.get(i).label().equalsIgnoreCase(contributor.label())) {
++                CONTRIBUTORS.set(i, contributor);
++                return;
++            }
++        }
++        CONTRIBUTORS.add(contributor);
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        final MinecraftServer server = MinecraftServer.getServer();
++        final KodamaGlobalConfiguration global = KodamaGlobalConfiguration.get();
++
++        sender.sendMessage(text("Kodama status", GREEN));
++        sender.sendMessage(text("Preset: ", GRAY).append(text(global.preset.key(), WHITE)));
++
++        sender.sendMessage(text("Global features:", GRAY));
++        for (final ConfigSchema.Option option : ConfigSchema.GLOBAL.options()) {
++            if (option.valueType() == PresetBoolean.class && option.path().endsWith(".enabled")) {
++                sender.sendMessage(featureLine(option.path().substring(0, option.path().length() - ".enabled".length()), (PresetBoolean) option.read(global)));
++            }
++        }
++
++        sender.sendMessage(text("World features:", GRAY));
++        for (final ServerLevel level : server.getAllLevels()) {
++            Component line = text("  " + level.getWorld().getName() + ": ", WHITE);
++            boolean first = true;
++            for (final ConfigSchema.Option option : ConfigSchema.WORLD.options()) {
++                if (option.valueType() == PresetBoolean.class && option.path().endsWith(".enabled")) {
++                    final PresetBoolean value = (PresetBoolean) option.read(level.kodamaConfig());
++                    line = line.append(text((first ? "" : ", ") + option.path().substring(0, option.path().length() - ".enabled".length()) + " ", GRAY))
++                        .append(onOff(value.get()));
++                    first = false;
++                }
++            }
++            sender.sendMessage(line);
++        }
++
++        final Set<String> tripped = FeatureGuard.trippedFeatures();
++        if (tripped.isEmpty()) {
++            sender.sendMessage(text("Tripped features: ", GRAY).append(text("none", GREEN)));
++        } else {
++            sender.sendMessage(text("Tripped features: ", GRAY).append(text(String.join(", ", tripped), RED))
++                .append(text(" (disabled after repeated errors, /kodama reload enables them again)", YELLOW)));
++        }
++
++        for (final StatusContributor contributor : CONTRIBUTORS) {
++            sender.sendMessage(text(contributor.label() + ": ", GRAY).append(contributor.describe()));
++        }
++        return true;
++    }
++
++    private static Component featureLine(final String feature, final PresetBoolean value) {
++        final Component line = text("  " + feature + ": ", WHITE).append(onOff(value.get()));
++        return value.isDefault() ? line.append(text(" (from preset)", GRAY)) : line.append(text(" (set explicitly)", GRAY));
++    }
++
++    private static Component onOff(final boolean enabled) {
++        return enabled ? text("on", GREEN) : text("off", RED);
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/VersionCommand.java b/src/main/java/dev/kodama/command/subcommands/VersionCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..53d6ffecc7f2450d1ee584c0a1592d9211310d66
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/VersionCommand.java
+@@ -0,0 +1,37 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.command.KodamaCommands;
++import dev.kodama.command.PermissionedKodamaSubcommand;
++import io.papermc.paper.ServerBuildInfo;
++import org.bukkit.Bukkit;
++import org.bukkit.command.CommandSender;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++@DefaultQualifier(NonNull.class)
++public final class VersionCommand extends PermissionedKodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "version";
++    public static final String PERM = KodamaCommands.COMMAND_BASE_PERM + "." + LITERAL_ARGUMENT;
++
++    public VersionCommand() {
++        super(PERM, PermissionDefault.TRUE);
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        final ServerBuildInfo build = ServerBuildInfo.buildInfo();
++        sender.sendMessage(text(build.brandName() + " " + build.asString(ServerBuildInfo.StringRepresentation.VERSION_FULL), GREEN));
++        sender.sendMessage(text("Minecraft: ", GRAY).append(text(build.minecraftVersionName(), WHITE)));
++        sender.sendMessage(text("Build: ", GRAY).append(text(build.buildNumber().isPresent() ? "#" + build.buildNumber().getAsInt() : "DEV", WHITE))
++            .append(text(build.gitCommit().map(commit -> " (" + commit + ")").orElse(""), GRAY)));
++        sender.sendMessage(text("API: ", GRAY).append(text(Bukkit.getBukkitVersion(), WHITE)));
++        return true;
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/ConfigEditor.java b/src/main/java/dev/kodama/config/ConfigEditor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..70480f66d942888d3fd4d7c25d4c3c0468ba60bd
+--- /dev/null
++++ b/src/main/java/dev/kodama/config/ConfigEditor.java
+@@ -0,0 +1,290 @@
++package dev.kodama.config;
++
++import com.mojang.logging.LogUtils;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.time.Instant;
++import java.util.ArrayDeque;
++import java.util.Deque;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Objects;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.format.NamedTextColor;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.Bukkit;
++import org.bukkit.command.CommandSender;
++import org.bukkit.command.ConsoleCommandSender;
++import org.bukkit.entity.Player;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.slf4j.Logger;
++
++/**
++ * In-game editing of the Kodama config files: parsing of typed values, the per-sender undo stack, the change log and
++ * the notice to a second editor of the same option.
++ */
++public final class ConfigEditor {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++    public static final int UNDO_DEPTH = 10;
++    private static final long NOTIFY_WINDOW_MILLIS = 10 * 60 * 1000L;
++    private static final Path CHANGE_LOG = Path.of("logs", "kodama-config-changes.log");
++
++    private record Change(ConfigTarget target, ConfigSchema.Option option, @Nullable Object oldRaw, @Nullable Object newRaw, String oldDisplay, String newDisplay) {
++    }
++
++    private record LastEdit(String senderKey, String senderName, long millis) {
++    }
++
++    private static final Map<String, Deque<Change>> UNDO_STACKS = new ConcurrentHashMap<>();
++    private static final Map<String, LastEdit> LAST_EDITS = new ConcurrentHashMap<>();
++
++    /**
++     * What a {@link #set} or {@link #undo} did, for the message to the sender.
++     */
++    public record Result(ConfigTarget target, ConfigSchema.Option option, String oldDisplay, String newDisplay, boolean unchanged) {
++    }
++
++    private ConfigEditor() {
++    }
++
++    /**
++     * The option and file of the sender's most recent change, or {@code null} if there is nothing to undo.
++     */
++    public static ConfigSchema.@Nullable Option peekUndoOption(final CommandSender sender) {
++        final Deque<Change> stack = UNDO_STACKS.get(senderKey(sender));
++        if (stack == null) {
++            return null;
++        }
++        synchronized (stack) {
++            final Change last = stack.peekFirst();
++            return last == null ? null : last.option();
++        }
++    }
++
++    /**
++     * @throws IllegalArgumentException when {@code input} is not a valid value for the option's type
++     * @throws ConfigReloadException    when the resulting config is invalid; nothing was written then
++     */
++    public static Result set(final CommandSender sender, final ConfigTarget target, final ConfigSchema.Option option, final String input) throws ConfigReloadException {
++        final Object raw = parse(option, input);
++        final Change change = apply(sender, target, option, raw, null);
++        if (change == null) {
++            final String shown = display(currentOrNull(target, option));
++            return new Result(target, option, shown, shown, true);
++        }
++        push(sender, change);
++        return new Result(target, option, change.oldDisplay(), change.newDisplay(), false);
++    }
++
++    /**
++     * Reverts the last change of the sender.
++     *
++     * @throws IllegalStateException when the sender has nothing to undo
++     */
++    public static Result undo(final CommandSender sender) throws ConfigReloadException {
++        final Deque<Change> stack = UNDO_STACKS.get(senderKey(sender));
++        final Change last;
++        if (stack == null) {
++            throw new IllegalStateException("There is nothing to undo");
++        }
++        synchronized (stack) {
++            last = stack.peekFirst();
++        }
++        if (last == null) {
++            throw new IllegalStateException("There is nothing to undo");
++        }
++        final Change reverted = apply(sender, last.target(), last.option(), last.oldRaw(), last);
++        synchronized (stack) {
++            stack.remove(last);
++        }
++        if (reverted == null) {
++            final String shown = display(currentOrNull(last.target(), last.option()));
++            return new Result(last.target(), last.option(), shown, shown, true);
++        }
++        return new Result(last.target(), last.option(), reverted.oldDisplay(), reverted.newDisplay(), false);
++    }
++
++    private static @Nullable Change apply(final CommandSender sender, final ConfigTarget target, final ConfigSchema.Option option, final @Nullable Object newRaw, final @Nullable Change undoing) throws ConfigReloadException {
++        final MinecraftServer server = MinecraftServer.getServer();
++        final KodamaConfigurations.EditOutcome outcome = server.kodamaConfigurations.edit(server, target, option, newRaw);
++        if (Objects.equals(outcome.oldRaw(), outcome.newRaw())) {
++            return null;
++        }
++        final Change change = new Change(target, option, outcome.oldRaw(), outcome.newRaw(),
++            displayInFile(target, outcome.oldRaw(), outcome.oldValue()), displayInFile(target, outcome.newRaw(), outcome.newValue()));
++        record(sender, change, undoing != null);
++        return change;
++    }
++
++    private static void push(final CommandSender sender, final Change change) {
++        final Deque<Change> stack = UNDO_STACKS.computeIfAbsent(senderKey(sender), key -> new ArrayDeque<>());
++        synchronized (stack) {
++            stack.addFirst(change);
++            while (stack.size() > UNDO_DEPTH) {
++                stack.removeLast();
++            }
++        }
++    }
++
++    private static @Nullable Object currentOrNull(final ConfigTarget target, final ConfigSchema.Option option) {
++        try {
++            final MinecraftServer server = MinecraftServer.getServer();
++            return server.kodamaConfigurations.currentValue(server, target, option);
++        } catch (final ConfigReloadException exception) {
++            return null;
++        }
++    }
++
++    // change log, INFO log and the notice to the previous editor
++
++    private static void record(final CommandSender sender, final Change change, final boolean undo) {
++        final String senderName = sender.getName();
++        final String file = change.target().fileName();
++        final String path = change.option().path();
++
++        LOGGER.info("Kodama config {} by {}: {} {}: {} -> {}", undo ? "undo" : "change", senderName, file, path, change.oldDisplay(), change.newDisplay());
++        appendToChangeLog(String.join("\t", Instant.now().toString(), clean(senderName), clean(file), clean(path), clean(change.oldDisplay()), clean(change.newDisplay())));
++
++        final String key = file + "|" + path;
++        final String senderKey = senderKey(sender);
++        final long now = System.currentTimeMillis();
++        final LastEdit previous = LAST_EDITS.put(key, new LastEdit(senderKey, senderName, now));
++        if (previous != null && !previous.senderKey().equals(senderKey) && now - previous.millis() <= NOTIFY_WINDOW_MILLIS) {
++            final @Nullable CommandSender other = onlineSender(previous.senderKey());
++            if (other != null) {
++                other.sendMessage(Component.text(senderName + " changed " + path + ": " + change.oldDisplay() + " -> " + change.newDisplay(), NamedTextColor.YELLOW));
++            }
++        }
++    }
++
++    private static synchronized void appendToChangeLog(final String line) {
++        try {
++            if (CHANGE_LOG.getParent() != null) {
++                Files.createDirectories(CHANGE_LOG.getParent());
++            }
++            Files.writeString(CHANGE_LOG, line + System.lineSeparator(), StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
++        } catch (final IOException exception) {
++            LOGGER.warn("Could not write {}", CHANGE_LOG, exception);
++        }
++    }
++
++    private static String clean(final String value) {
++        return value.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
++    }
++
++    private static String senderKey(final CommandSender sender) {
++        return sender instanceof Player player ? "player:" + player.getUniqueId() : "other:" + sender.getName();
++    }
++
++    private static @Nullable CommandSender onlineSender(final String senderKey) {
++        if (senderKey.startsWith("player:")) {
++            return Bukkit.getPlayer(UUID.fromString(senderKey.substring("player:".length())));
++        }
++        final ConsoleCommandSender console = Bukkit.getConsoleSender();
++        return senderKey.equals("other:" + console.getName()) ? console : null;
++    }
++
++    // values
++
++    /**
++     * Converts what the user typed into the raw value that is written to the YAML file. The result is validated as a
++     * whole when the file is loaded.
++     */
++    static Object parse(final ConfigSchema.Option option, final String input) {
++        final Class<?> type = option.valueType();
++        final String text = input.trim();
++        try {
++            if (PresetValue.class.isAssignableFrom(type) && text.equalsIgnoreCase(PresetValue.DEFAULT_VALUE)) {
++                return PresetValue.DEFAULT_VALUE;
++            }
++            if (type == PresetBoolean.class || type == boolean.class || type == Boolean.class) {
++                if (text.equalsIgnoreCase("true")) {
++                    return Boolean.TRUE;
++                }
++                if (text.equalsIgnoreCase("false")) {
++                    return Boolean.FALSE;
++                }
++                throw new IllegalArgumentException("'" + input + "' is not " + (type == PresetBoolean.class ? "true, false or default" : "true or false"));
++            }
++            if (type == PresetInt.class || type == int.class || type == Integer.class) {
++                return Integer.parseInt(text);
++            }
++            if (type == long.class || type == Long.class) {
++                return Long.parseLong(text);
++            }
++            if (type == PresetDouble.class || type == double.class || type == Double.class || type == float.class || type == Float.class) {
++                final double value = Double.parseDouble(text);
++                if (Double.isNaN(value) || Double.isInfinite(value)) {
++                    throw new NumberFormatException();
++                }
++                return value;
++            }
++            if (type.isEnum()) {
++                for (final Object constant : type.getEnumConstants()) {
++                    if (KodamaEnumSerializer.keyOf((Enum<?>) constant).equals(text.toLowerCase(Locale.ROOT).replace('_', '-'))) {
++                        return KodamaEnumSerializer.keyOf((Enum<?>) constant);
++                    }
++                }
++                throw new IllegalArgumentException("'" + input + "' is not one of: " + String.join(", ", valueSuggestions(option)));
++            }
++            if (type == String.class) {
++                return input;
++            }
++        } catch (final NumberFormatException exception) {
++            throw new IllegalArgumentException("'" + input + "' is not a valid " + (PresetInt.class.isAssignableFrom(type) || type == int.class || type == Integer.class || type == long.class || type == Long.class ? "whole number" : "number"));
++        }
++        throw new IllegalArgumentException("Options of type " + type.getSimpleName() + " cannot be set from the command");
++    }
++
++    /**
++     * Values that make sense to suggest for the option, for tab completion.
++     */
++    public static List<String> valueSuggestions(final ConfigSchema.Option option) {
++        final Class<?> type = option.valueType();
++        if (type == PresetBoolean.class) {
++            return List.of("true", "false", PresetValue.DEFAULT_VALUE);
++        }
++        if (type == boolean.class || type == Boolean.class) {
++            return List.of("true", "false");
++        }
++        if (PresetValue.class.isAssignableFrom(type)) {
++            return List.of(PresetValue.DEFAULT_VALUE);
++        }
++        if (type.isEnum()) {
++            final Object[] constants = type.getEnumConstants();
++            final String[] keys = new String[constants.length];
++            for (int i = 0; i < constants.length; i++) {
++                keys[i] = KodamaEnumSerializer.keyOf((Enum<?>) constants[i]);
++            }
++            return List.of(keys);
++        }
++        return List.of();
++    }
++
++    /**
++     * A key that is absent from a world's own file is inherited from the world defaults; say so.
++     */
++    private static String displayInFile(final ConfigTarget target, final @Nullable Object raw, final @Nullable Object value) {
++        return target.scope() == ConfigTarget.Scope.WORLD && raw == null ? "inherited: " + display(value) : display(value);
++    }
++
++    public static String display(final @Nullable Object value) {
++        if (value == null) {
++            return "none";
++        }
++        if (value instanceof PresetValue<?> presetValue) {
++            return presetValue.describe();
++        }
++        if (value instanceof Enum<?> constant) {
++            return KodamaEnumSerializer.keyOf(constant);
++        }
++        return String.valueOf(value);
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index 6b0877ffa4a86feed954b5d9c2b26816c70d5c17..9a7ed048465bad08a5cd9dadd91cae9ea155ffe1 100644
+--- a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -235,6 +235,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+         org.spigotmc.WatchdogThread.doStart(org.spigotmc.SpigotConfig.timeoutTime, org.spigotmc.SpigotConfig.restartOnCrash); // Paper - start watchdog thread
+         thread.start(); // Paper - Enhance console tab completions for brigadier commands; start console thread after MinecraftServer.console & PaperConfig are initialized
+         io.papermc.paper.command.PaperCommands.registerCommands(this); // Paper - setup /paper command
++        dev.kodama.command.KodamaCommands.registerCommands(this); // Kodama - Kodama commands - register commands
+         com.destroystokyo.paper.Metrics.PaperMetrics.startMetrics(); // Paper - start metrics
+         com.destroystokyo.paper.VersionHistoryManager.INSTANCE.getClass(); // Paper - load version history now
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java b/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java
+index e0e61115ada9a49d4c528c5d4e02a1ca571d9531..3259f62059854c115b769fda91243dd2bd91a58b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java
++++ b/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java
+@@ -5,6 +5,7 @@ import org.bukkit.util.permissions.DefaultPermissions;
+ 
+ public final class CraftDefaultPermissions {
+     private static final String ROOT = "minecraft";
++    public static final String KODAMA_ROOT = "kodama"; // Kodama - Kodama commands - set Kodama permissions root
+ 
+     private CraftDefaultPermissions() {}
+ 
