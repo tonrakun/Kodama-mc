@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 20:28:30 +0900
+Subject: [PATCH] Kodama: pre-generate chunks only while nobody is online by
+ default
+
+License: GPL-3.0
+
+Generated chunks are finished on the main thread. Even 2 concurrent
+generations raised MSPT p99 well above Paper while players were online, so the
+default for max-concurrent is now 0 (pause while players are online).
+
+diff --git a/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java b/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java
+index 3f238e437539b15b15bec1b222d8adcbabe380d5..ff263edd1d14778a251d23f28aabc5a88d65a5bd 100644
+--- a/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java
++++ b/src/main/java/dev/kodama/chunk/precache/PrecacheManager.java
+@@ -100,7 +100,7 @@ public final class PrecacheManager {
+             pause = WorldPrecache.State.PAUSED_MANUAL;
+         } else if (mspt > PrecacheSettings.maxMspt()) {
+             pause = WorldPrecache.State.PAUSED_MSPT;
+-        } else if (playersBusy(players)) {
++        } else if (limit == 0 || playersBusy(players)) {
+             pause = WorldPrecache.State.PAUSED_PLAYERS;
+         }
+ 
+diff --git a/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java b/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java
+index 67431a9df112b02d5249b3b40ad6b11e921173e6..4334162cb0ab71f265d678e8a5d2216ea77272c6 100644
+--- a/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java
++++ b/src/main/java/dev/kodama/chunk/precache/PrecacheSettings.java
+@@ -64,7 +64,7 @@ final class PrecacheSettings {
+ 
+     static int maxConcurrent() {
+         final KodamaGlobalConfiguration.Precache section = section();
+-        return section == null ? 8 : Math.max(1, section.maxConcurrent);
++        return section == null ? 0 : Math.max(0, section.maxConcurrent);
+     }
+ 
+     static int maxConcurrentIdle() {
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index 2b762da5a1cc91ec4476018f1f2d6e7ad4c908fe..9d2586d9ee943eb0feec8551025ba5fc63a6f7f3 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -227,9 +227,11 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+         @Constraint(Constraints.Positive.class)
+         public double maxMspt = 35.0;
+ 
+-        @Comment("Maximum number of chunks that are generated at the same time while players are online.")
+-        @Constraints.Min(1)
+-        public int maxConcurrent = 8;
++        @Comment("Maximum number of chunks that are generated at the same time while players are online.\n"
++            + "Each generated chunk is finished on the main thread, so any value costs MSPT while people play;\n"
++            + "0 (default) pre-generates only while nobody is online.")
++        @Constraints.Min(0)
++        public int maxConcurrent = 0;
+ 
+         @Comment("Maximum number of chunks that are generated at the same time while nobody is online.")
+         @Constraints.Min(1)

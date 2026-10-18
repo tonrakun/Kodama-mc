@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 20:08:09 +0900
+Subject: [PATCH] Kodama: Mob LOD distances inside Paper's activation range
+
+License: GPL-3.0
+
+MID mobs run full physics every tick, so a MID band beyond Paper's entity
+activation range (32 blocks for monsters) made the server slower than Paper.
+Place NEAR/MID inside the activation range instead; FAR keeps Paper's
+activation range behaviour.
+
+diff --git a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+index 9cea1fe1ae2ec4c2eed91fb73b83a8db8ef4b921..0e26545eb582401bbd3bbc106b05f5b329df1b9b 100644
+--- a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+@@ -38,10 +38,10 @@ public class KodamaWorldConfiguration extends ConfigurationPart {
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
+ 
+         @Comment("Mobs closer than this many blocks to the nearest player are fully simulated (NEAR). 0 turns mob level of detail off.")
+-        public PresetInt nearDistance = PresetInt.of(0, 32, 24);
++        public PresetInt nearDistance = PresetInt.of(0, 16, 12);
+ 
+         @Comment("Mobs farther than this many blocks from the nearest player are FAR; between near-distance and far-distance they are MID (full physics, reduced AI).")
+-        public PresetInt farDistance = PresetInt.of(0, 64, 48);
++        public PresetInt farDistance = PresetInt.of(0, 32, 24);
+ 
+         @Comment("Blocks of margin around near-distance and far-distance: a mob moves to a farther tier at threshold + hysteresis and back at threshold - hysteresis.")
+         public PresetInt hysteresis = PresetInt.of(0, 8, 8);

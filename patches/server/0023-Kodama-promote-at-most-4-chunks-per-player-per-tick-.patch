@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 20:55:32 +0900
+Subject: [PATCH] Kodama: promote at most 4 chunks per player per tick to
+ ticking
+
+License: GPL-3.0
+
+With 16 per tick a settler benchmark still had ticks over 50 ms; 4 removes
+them without changing average MSPT.
+
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index 9d2586d9ee943eb0feec8551025ba5fc63a6f7f3..6b7af960f47cc09ab8ddeb7bd54d26359094720d 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -63,7 +63,7 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+         @Comment("How many chunks per player may start ticking in one tick, 0 for no limit.\n"
+             + "A chunk that starts ticking runs its post-generation fluid updates, so many at once cause a lag spike.\n"
+             + "Chunks are still sent to the client without waiting for this.")
+-        public PresetInt maxTickingPromotionsPerTick = PresetInt.of(0, 16, 8);
++        public PresetInt maxTickingPromotionsPerTick = PresetInt.of(0, 4, 4);
+ 
+         @Comment("Loads the chunks in the direction the player is moving first.")
+         public Priority priority;

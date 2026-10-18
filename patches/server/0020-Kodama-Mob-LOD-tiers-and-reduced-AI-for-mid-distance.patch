@@ -1,0 +1,1563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Sun, 18 Oct 2026 20:02:28 +0900
+Subject: [PATCH] Kodama: Mob LOD tiers and reduced AI for mid distance
+
+License: GPL-3.0
+
+Assigns every mob a NEAR, MID or FAR tier from the distance to the nearest
+player, with hysteresis and staggered evaluation. NEAR and MID mobs are always
+active; FAR mobs still follow Paper's activation range. MID mobs choose goals,
+targets and brain behaviors only every mid-ai-interval ticks and calculate new
+paths at most every mid-path-interval ticks. Plugin AI API use, custom goals,
+metadata, names, leashes, bosses, raids, damage and interaction keep a mob
+NEAR; AFK players, fluids and falling mobs keep it from being FAR; excluded
+areas are managed with /kodama lod exclude. Failures are reported to the
+mob-lod FeatureGuard.
+
+diff --git a/src/main/java/com/destroystokyo/paper/entity/PaperPathfinder.java b/src/main/java/com/destroystokyo/paper/entity/PaperPathfinder.java
+index 28a94b1d75281e797fd1e5e9288725f78b7e7ba6..e2b4ba67c7f93128b7f716675a663c6c9c7e94ce 100644
+--- a/src/main/java/com/destroystokyo/paper/entity/PaperPathfinder.java
++++ b/src/main/java/com/destroystokyo/paper/entity/PaperPathfinder.java
+@@ -31,6 +31,7 @@ public class PaperPathfinder implements com.destroystokyo.paper.entity.Pathfinde
+ 
+     @Override
+     public void stopPathfinding() {
++        dev.kodama.entity.lod.MobLod.touch(entity); // Kodama - mob-lod
+         entity.getNavigation().stop();
+     }
+ 
+@@ -49,6 +50,7 @@ public class PaperPathfinder implements com.destroystokyo.paper.entity.Pathfinde
+     @Nullable
+     @Override
+     public PathResult findPath(Location loc) {
++        dev.kodama.entity.lod.MobLod.touch(entity); // Kodama - mob-lod
+         Validate.notNull(loc, "Location can not be null");
+         Path path;
+         try (var ignored = dev.kodama.async.AsyncSettings.forceSyncPathfinding()) { // Kodama - plugins always get a complete path
+@@ -60,6 +62,7 @@ public class PaperPathfinder implements com.destroystokyo.paper.entity.Pathfinde
+     @Nullable
+     @Override
+     public PathResult findPath(LivingEntity target) {
++        dev.kodama.entity.lod.MobLod.touch(entity); // Kodama - mob-lod
+         Validate.notNull(target, "Target can not be null");
+         Path path;
+         try (var ignored = dev.kodama.async.AsyncSettings.forceSyncPathfinding()) { // Kodama - plugins always get a complete path
+@@ -70,6 +73,7 @@ public class PaperPathfinder implements com.destroystokyo.paper.entity.Pathfinde
+ 
+     @Override
+     public boolean moveTo(@Nonnull PathResult path, double speed) {
++        dev.kodama.entity.lod.MobLod.touch(entity); // Kodama - mob-lod
+         Validate.notNull(path, "PathResult can not be null");
+         Path pathEntity = ((PaperPathResult) path).path;
+         return entity.getNavigation().moveTo(pathEntity, speed);
+diff --git a/src/main/java/com/destroystokyo/paper/entity/ai/PaperMobGoals.java b/src/main/java/com/destroystokyo/paper/entity/ai/PaperMobGoals.java
+index 30ed9ffd6a65914d7545636150a09327aba047c3..85d2a081805bfd9bef253c79ffae216128037c54 100644
+--- a/src/main/java/com/destroystokyo/paper/entity/ai/PaperMobGoals.java
++++ b/src/main/java/com/destroystokyo/paper/entity/ai/PaperMobGoals.java
+@@ -24,12 +24,14 @@ public class PaperMobGoals implements MobGoals {
+             mojangGoal = new PaperCustomGoal<>(goal);
+         }
+ 
++        dev.kodama.entity.lod.MobLod.markCustomGoals(craftMob.getHandle()); // Kodama - mob-lod
+         getHandle(craftMob, goal.getTypes()).addGoal(priority, mojangGoal);
+     }
+ 
+     @Override
+     public <T extends Mob> void removeGoal(T mob, Goal<T> goal) {
+         CraftMob craftMob = (CraftMob) mob;
++        dev.kodama.entity.lod.MobLod.markCustomGoals(craftMob.getHandle()); // Kodama - mob-lod
+         if (goal instanceof PaperCustomGoal) {
+             getHandle(craftMob, goal.getTypes()).removeGoal((net.minecraft.world.entity.ai.goal.Goal) goal);
+         } else if (goal instanceof PaperVanillaGoal) {
+@@ -207,6 +209,7 @@ public class PaperMobGoals implements MobGoals {
+     }
+ 
+     private GoalSelector getHandle(CraftMob mob, EnumSet<GoalType> types) {
++        dev.kodama.entity.lod.MobLod.touch(mob.getHandle()); // Kodama - mob-lod
+         if (types.contains(GoalType.TARGET)) {
+             return mob.getHandle().targetSelector;
+         } else {
+@@ -215,6 +218,7 @@ public class PaperMobGoals implements MobGoals {
+     }
+ 
+     private GoalSelector getHandle(CraftMob mob, GoalType type) {
++        dev.kodama.entity.lod.MobLod.touch(mob.getHandle()); // Kodama - mob-lod
+         if (type == GoalType.TARGET) {
+             return mob.getHandle().targetSelector;
+         } else {
+diff --git a/src/main/java/dev/kodama/command/KodamaCommand.java b/src/main/java/dev/kodama/command/KodamaCommand.java
+index deec776d0dec0e8571cd9cf0f7c3f3fda3da2036..605e73ef17fc95042b97229a4afe0e8e3a4a4cbb 100644
+--- a/src/main/java/dev/kodama/command/KodamaCommand.java
++++ b/src/main/java/dev/kodama/command/KodamaCommand.java
+@@ -1,6 +1,7 @@
+ package dev.kodama.command;
+ 
+ import dev.kodama.command.subcommands.ConfigCommand;
++import dev.kodama.command.subcommands.LodCommand;
+ import dev.kodama.command.subcommands.PrecacheCommand;
+ import dev.kodama.command.subcommands.ReloadCommand;
+ import dev.kodama.command.subcommands.StatusCommand;
+@@ -42,6 +43,7 @@ public final class KodamaCommand extends Command {
+         SUBCOMMANDS.put(VersionCommand.LITERAL_ARGUMENT, new VersionCommand());
+         SUBCOMMANDS.put(ConfigCommand.LITERAL_ARGUMENT, new ConfigCommand());
+         SUBCOMMANDS.put(PrecacheCommand.LITERAL_ARGUMENT, new PrecacheCommand());
++        SUBCOMMANDS.put(LodCommand.LITERAL_ARGUMENT, new LodCommand());
+     }
+ 
+     public KodamaCommand() {
+diff --git a/src/main/java/dev/kodama/command/subcommands/LodCommand.java b/src/main/java/dev/kodama/command/subcommands/LodCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3c74eeb37f256c177ef7842149c8ab327ef2b4e
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/LodCommand.java
+@@ -0,0 +1,282 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.command.Completions;
++import dev.kodama.command.KodamaCommands;
++import dev.kodama.command.PermissionedKodamaSubcommand;
++import dev.kodama.config.ConfigEditor;
++import dev.kodama.config.ConfigReloadException;
++import dev.kodama.config.ConfigSchema;
++import dev.kodama.config.ConfigTarget;
++import dev.kodama.config.KodamaConfigurations;
++import dev.kodama.config.KodamaWorldConfiguration;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.bukkit.Bukkit;
++import org.bukkit.Location;
++import org.bukkit.World;
++import org.bukkit.command.CommandSender;
++import org.bukkit.entity.Player;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++/**
++ * {@code /kodama lod exclude add|remove|list}: manages the areas of {@code mob-lod.excluded-areas} in the
++ * {@code kodama-world.yml} of a world, where mobs are always fully simulated.
++ */
++@DefaultQualifier(NonNull.class)
++public final class LodCommand extends PermissionedKodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "lod";
++    public static final String PERM = KodamaCommands.COMMAND_BASE_PERM + "." + LITERAL_ARGUMENT;
++
++    private static final String OPTION_PATH = "mob-lod.excluded-areas";
++    private static final List<String> ACTIONS = List.of("add", "remove", "list");
++    private static final String ADD_USAGE = "/kodama lod exclude add <name> <radius> [x z world]";
++    private static final String REMOVE_USAGE = "/kodama lod exclude remove <name> [world]";
++    private static final String LIST_USAGE = "/kodama lod exclude list [world]";
++
++    public LodCommand() {
++        super(PERM, PermissionDefault.OP);
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length < 2 || !args[0].equalsIgnoreCase("exclude")) {
++            sendUsage(sender);
++            return false;
++        }
++        final String[] rest = java.util.Arrays.copyOfRange(args, 2, args.length);
++        try {
++            switch (args[1].toLowerCase(Locale.ROOT)) {
++                case "add" -> {
++                    return this.add(sender, rest);
++                }
++                case "remove" -> {
++                    return this.remove(sender, rest);
++                }
++                case "list" -> {
++                    return this.list(sender, rest);
++                }
++                default -> {
++                    sendUsage(sender);
++                    return false;
++                }
++            }
++        } catch (final ConfigReloadException exception) {
++            sender.sendMessage(text("Could not write the world config: " + exception.getMessage(), RED));
++            return false;
++        }
++    }
++
++    private static void sendUsage(final CommandSender sender) {
++        sender.sendMessage(text("Usage:", RED));
++        sender.sendMessage(text("  " + ADD_USAGE, RED));
++        sender.sendMessage(text("  " + REMOVE_USAGE, RED));
++        sender.sendMessage(text("  " + LIST_USAGE, RED));
++    }
++
++    private boolean add(final CommandSender sender, final String[] args) throws ConfigReloadException {
++        if (args.length < 2 || args.length == 3 || args.length > 5) {
++            sender.sendMessage(text("Usage: " + ADD_USAGE, RED));
++            return false;
++        }
++        final String name = args[0];
++        final double radius;
++        try {
++            radius = Double.parseDouble(args[1]);
++        } catch (final NumberFormatException exception) {
++            sender.sendMessage(text("'" + args[1] + "' is not a number.", RED));
++            return false;
++        }
++        if (!(radius > 0.0) || Double.isInfinite(radius)) {
++            sender.sendMessage(text("The radius must be larger than 0.", RED));
++            return false;
++        }
++
++        final double x;
++        final double z;
++        final @Nullable ServerLevel level;
++        if (args.length >= 4) {
++            try {
++                x = Double.parseDouble(args[2]);
++                z = Double.parseDouble(args[3]);
++            } catch (final NumberFormatException exception) {
++                sender.sendMessage(text("The coordinates must be numbers.", RED));
++                return false;
++            }
++            level = args.length == 5 ? level(args[4]) : senderLevel(sender);
++        } else if (sender instanceof Player player) {
++            final Location location = player.getLocation();
++            x = location.getX();
++            z = location.getZ();
++            level = senderLevel(sender);
++        } else {
++            sender.sendMessage(text("The console must give the position: " + ADD_USAGE, RED));
++            return false;
++        }
++        if (level == null) {
++            sender.sendMessage(text("Unknown world. The console must name the world.", RED));
++            return false;
++        }
++
++        final List<Map<String, Object>> areas = currentAreas(level);
++        for (final Map<String, Object> area : areas) {
++            if (String.valueOf(area.get("name")).equalsIgnoreCase(name)) {
++                sender.sendMessage(text("There is already an area named '" + name + "' in " + level.getWorld().getName() + ".", RED));
++                return false;
++            }
++        }
++        final Map<String, Object> area = new LinkedHashMap<>();
++        area.put("name", name);
++        area.put("x", x);
++        area.put("z", z);
++        area.put("radius", radius);
++        areas.add(area);
++        write(sender, level, areas);
++        sender.sendMessage(text(String.format(Locale.ROOT, "Added LOD-free area '%s' in %s at %.1f / %.1f, radius %.1f.", name, level.getWorld().getName(), x, z, radius), GREEN));
++        return true;
++    }
++
++    private boolean remove(final CommandSender sender, final String[] args) throws ConfigReloadException {
++        if (args.length < 1 || args.length > 2) {
++            sender.sendMessage(text("Usage: " + REMOVE_USAGE, RED));
++            return false;
++        }
++        final @Nullable ServerLevel level = args.length == 2 ? level(args[1]) : senderLevel(sender);
++        if (level == null) {
++            sender.sendMessage(text("Unknown world. The console must name the world.", RED));
++            return false;
++        }
++        final List<Map<String, Object>> areas = currentAreas(level);
++        boolean removed = false;
++        for (int i = areas.size() - 1; i >= 0; i--) {
++            if (String.valueOf(areas.get(i).get("name")).equalsIgnoreCase(args[0])) {
++                areas.remove(i);
++                removed = true;
++            }
++        }
++        if (!removed) {
++            sender.sendMessage(text("There is no area named '" + args[0] + "' in " + level.getWorld().getName() + ".", RED));
++            return false;
++        }
++        write(sender, level, areas);
++        sender.sendMessage(text("Removed LOD-free area '" + args[0] + "' from " + level.getWorld().getName() + ".", GREEN));
++        return true;
++    }
++
++    private boolean list(final CommandSender sender, final String[] args) {
++        if (args.length > 1) {
++            sender.sendMessage(text("Usage: " + LIST_USAGE, RED));
++            return false;
++        }
++        final List<ServerLevel> levels = new ArrayList<>();
++        if (args.length == 1) {
++            final @Nullable ServerLevel level = level(args[0]);
++            if (level == null) {
++                sender.sendMessage(text("Unknown world.", RED));
++                return false;
++            }
++            levels.add(level);
++        } else {
++            for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                levels.add(level);
++            }
++        }
++        boolean any = false;
++        for (final ServerLevel level : levels) {
++            for (final KodamaWorldConfiguration.MobLod.ExcludedArea area : level.kodamaConfig().mobLod.excludedAreas) {
++                any = true;
++                sender.sendMessage(text("  " + level.getWorld().getName() + ": ", WHITE).append(text(
++                    String.format(Locale.ROOT, "%s at %.1f / %.1f, radius %.1f", area.name(), area.x(), area.z(), area.radius()), GRAY)));
++            }
++        }
++        if (!any) {
++            sender.sendMessage(text("No LOD-free areas.", GRAY));
++        }
++        return true;
++    }
++
++    private static List<Map<String, Object>> currentAreas(final ServerLevel level) {
++        final List<Map<String, Object>> areas = new ArrayList<>();
++        for (final KodamaWorldConfiguration.MobLod.ExcludedArea area : level.kodamaConfig().mobLod.excludedAreas) {
++            final Map<String, Object> raw = new LinkedHashMap<>();
++            raw.put("name", area.name());
++            raw.put("x", area.x());
++            raw.put("z", area.z());
++            raw.put("radius", area.radius());
++            areas.add(raw);
++        }
++        return areas;
++    }
++
++    private static void write(final CommandSender sender, final ServerLevel level, final List<Map<String, Object>> areas) throws ConfigReloadException {
++        final ConfigSchema.Option option = ConfigSchema.WORLD.find(OPTION_PATH);
++        if (option == null) {
++            throw new ConfigReloadException("The option " + OPTION_PATH + " does not exist");
++        }
++        ConfigEditor.setRaw(sender, ConfigTarget.world(level.getWorld().getName()), option, areas.isEmpty() ? null : areas);
++    }
++
++    private static @Nullable ServerLevel senderLevel(final CommandSender sender) {
++        return sender instanceof Player player ? ((org.bukkit.craftbukkit.CraftWorld) player.getWorld()).getHandle() : null;
++    }
++
++    private static @Nullable ServerLevel level(final String name) {
++        return KodamaConfigurations.levelByName(MinecraftServer.getServer(), name);
++    }
++
++    @Override
++    public List<String> tabComplete(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length <= 1) {
++            return Completions.matchingLast(args, List.of("exclude"));
++        }
++        if (!args[0].equalsIgnoreCase("exclude")) {
++            return Collections.emptyList();
++        }
++        if (args.length == 2) {
++            return Completions.matchingLast(args, ACTIONS);
++        }
++        final List<String> worlds = new ArrayList<>();
++        for (final World world : Bukkit.getWorlds()) {
++            worlds.add(world.getName());
++        }
++        switch (args[1].toLowerCase(Locale.ROOT)) {
++            case "remove" -> {
++                if (args.length == 3) {
++                    final List<String> names = new ArrayList<>();
++                    final @Nullable ServerLevel level = senderLevel(sender);
++                    if (level != null) {
++                        for (final KodamaWorldConfiguration.MobLod.ExcludedArea area : level.kodamaConfig().mobLod.excludedAreas) {
++                            names.add(area.name());
++                        }
++                    }
++                    return Completions.matchingLast(args, names);
++                }
++                return args.length == 4 ? Completions.matchingLast(args, worlds) : Collections.emptyList();
++            }
++            case "list" -> {
++                return args.length == 3 ? Completions.matchingLast(args, worlds) : Collections.emptyList();
++            }
++            case "add" -> {
++                return args.length == 7 ? Completions.matchingLast(args, worlds) : Collections.emptyList();
++            }
++            default -> {
++                return Collections.emptyList();
++            }
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+index 80072812a69c81776471974b03fc33eb831a56d7..1ee8472448aa9b982ea44c4c5bfd917ed0b84c69 100644
+--- a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -49,6 +49,7 @@ public final class StatusCommand extends PermissionedKodamaSubcommand {
+         }
+         dev.kodama.chunk.ChunkLoadingStatus.register();
+         dev.kodama.chunk.precache.PrecacheStatus.register();
++        dev.kodama.entity.lod.MobLodStatus.register();
+     }
+ 
+     public StatusCommand() {
+diff --git a/src/main/java/dev/kodama/config/ConfigEditor.java b/src/main/java/dev/kodama/config/ConfigEditor.java
+index 70480f66d942888d3fd4d7c25d4c3c0468ba60bd..435ce2b8af37c4032f1b4c97ebe006127f2ac290 100644
+--- a/src/main/java/dev/kodama/config/ConfigEditor.java
++++ b/src/main/java/dev/kodama/config/ConfigEditor.java
+@@ -83,6 +83,22 @@ public final class ConfigEditor {
+         return new Result(target, option, change.oldDisplay(), change.newDisplay(), false);
+     }
+ 
++    /**
++     * Like {@link #set} for a value that is given as raw YAML data (a list, for example) instead of text, so commands
++     * that manage such options can use the same file writing, validation, undo and change log.
++     *
++     * @throws ConfigReloadException when the resulting config is invalid; nothing was written then
++     */
++    public static Result setRaw(final CommandSender sender, final ConfigTarget target, final ConfigSchema.Option option, final Object raw) throws ConfigReloadException {
++        final Change change = apply(sender, target, option, raw, null);
++        if (change == null) {
++            final String shown = display(currentOrNull(target, option));
++            return new Result(target, option, shown, shown, true);
++        }
++        push(sender, change);
++        return new Result(target, option, change.oldDisplay(), change.newDisplay(), false);
++    }
++
+     /**
+      * Reverts the last change of the sender.
+      *
+diff --git a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+index b325e792d63dece944230d0bce9fd94787cc8407..9cea1fe1ae2ec4c2eed91fb73b83a8db8ef4b921 100644
+--- a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+@@ -36,6 +36,48 @@ public class KodamaWorldConfiguration extends ConfigurationPart {
+     public class MobLod extends ConfigurationPart {
+         @Comment("Enables mob level of detail in this world.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++        @Comment("Mobs closer than this many blocks to the nearest player are fully simulated (NEAR). 0 turns mob level of detail off.")
++        public PresetInt nearDistance = PresetInt.of(0, 32, 24);
++
++        @Comment("Mobs farther than this many blocks from the nearest player are FAR; between near-distance and far-distance they are MID (full physics, reduced AI).")
++        public PresetInt farDistance = PresetInt.of(0, 64, 48);
++
++        @Comment("Blocks of margin around near-distance and far-distance: a mob moves to a farther tier at threshold + hysteresis and back at threshold - hysteresis.")
++        public PresetInt hysteresis = PresetInt.of(0, 8, 8);
++
++        @Comment("Ticks between two tier evaluations of the same mob. The mobs are spread over these ticks.")
++        public int updateInterval = 10;
++
++        @Comment("MID mobs choose new goals, targets and brain behaviors only every this many ticks (1 = like vanilla). Running goals still tick every tick.")
++        public PresetInt midAiInterval = PresetInt.of(1, 4, 8);
++
++        @Comment("MID mobs calculate a new path at most every this many ticks and reuse the current path while its target moved at most 1 block (1 = like vanilla).")
++        public PresetInt midPathInterval = PresetInt.of(1, 10, 20);
++
++        @Comment("A player who moved less than afk-move-threshold blocks during the last afk-seconds counts as waiting (AFK farm).")
++        public int afkSeconds = 180;
++
++        @Comment("Blocks a player may move during afk-seconds and still count as waiting.")
++        public double afkMoveThreshold = 2.0;
++
++        @Comment("Mobs within this many blocks of a waiting player are never FAR.")
++        public int afkRadius = 128;
++
++        @Comment("Seconds a mob stays NEAR after a plugin used AI related API on it.")
++        public int apiPinSeconds = 30;
++
++        @Comment("Areas where mobs are always NEAR, each a cylinder over the full height: {name, x, z, radius}. Manage them with /kodama lod exclude.")
++        public java.util.List<ExcludedArea> excludedAreas = new java.util.ArrayList<>();
++
++        @org.spongepowered.configurate.objectmapping.ConfigSerializable
++        public record ExcludedArea(
++            @org.spongepowered.configurate.objectmapping.meta.Required String name,
++            @org.spongepowered.configurate.objectmapping.meta.Required double x,
++            @org.spongepowered.configurate.objectmapping.meta.Required double z,
++            @org.spongepowered.configurate.objectmapping.meta.Required double radius
++        ) {
++        }
+     }
+ 
+     @Comment("Redstone optimizations.")
+diff --git a/src/main/java/dev/kodama/entity/lod/AfkTracker.java b/src/main/java/dev/kodama/entity/lod/AfkTracker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5db12f6daaddfbefab0f0015acf885e49c99ab75
+--- /dev/null
++++ b/src/main/java/dev/kodama/entity/lod/AfkTracker.java
+@@ -0,0 +1,91 @@
++package dev.kodama.entity.lod;
++
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import net.minecraft.server.level.ServerPlayer;
++
++/**
++ * Finds players who stand (nearly) still for a long time, for example in front of a mob farm. A position sample is
++ * taken every five seconds; a player is waiting when the samples of the whole window stay within the move threshold.
++ */
++final class AfkTracker {
++
++    static final int SAMPLE_TICKS = 100;
++
++    private static final class State {
++        final double[] positions; // x, y, z per sample, used as a ring
++        int count;
++        int next;
++        boolean waiting;
++
++        State(final int capacity) {
++            this.positions = new double[capacity * 3];
++        }
++
++        int capacity() {
++            return this.positions.length / 3;
++        }
++    }
++
++    private final Map<UUID, State> states = new HashMap<>();
++
++    /**
++     * Main thread, once per {@link #SAMPLE_TICKS}.
++     */
++    void sample(final List<ServerPlayer> players, final int afkTicks, final double moveThreshold) {
++        final int capacity = (afkTicks + SAMPLE_TICKS - 1) / SAMPLE_TICKS + 1;
++        final double thresholdSquared = moveThreshold * moveThreshold;
++        for (final Iterator<UUID> it = this.states.keySet().iterator(); it.hasNext();) {
++            final UUID id = it.next();
++            boolean present = false;
++            for (int i = 0; i < players.size(); i++) {
++                if (players.get(i).getUUID().equals(id)) {
++                    present = true;
++                    break;
++                }
++            }
++            if (!present) {
++                it.remove();
++            }
++        }
++        for (int i = 0; i < players.size(); i++) {
++            final ServerPlayer player = players.get(i);
++            State state = this.states.get(player.getUUID());
++            if (state == null || state.capacity() != capacity) {
++                state = new State(capacity);
++                this.states.put(player.getUUID(), state);
++            }
++            final double x = player.getX();
++            final double y = player.getY();
++            final double z = player.getZ();
++            final int slot = state.next * 3;
++            state.positions[slot] = x;
++            state.positions[slot + 1] = y;
++            state.positions[slot + 2] = z;
++            state.next = (state.next + 1) % capacity;
++            if (state.count < capacity) {
++                state.count++;
++            }
++            boolean still = state.count == capacity;
++            for (int s = 0; still && s < state.count; s++) {
++                final double dx = state.positions[s * 3] - x;
++                final double dy = state.positions[s * 3 + 1] - y;
++                final double dz = state.positions[s * 3 + 2] - z;
++                still = dx * dx + dy * dy + dz * dz <= thresholdSquared;
++            }
++            state.waiting = still;
++        }
++    }
++
++    boolean isWaiting(final ServerPlayer player) {
++        final State state = this.states.get(player.getUUID());
++        return state != null && state.waiting;
++    }
++
++    void clear() {
++        this.states.clear();
++    }
++}
+diff --git a/src/main/java/dev/kodama/entity/lod/MobLod.java b/src/main/java/dev/kodama/entity/lod/MobLod.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..81d7da7a8e98a782722044b4e49cabe3e3b95ca9
+--- /dev/null
++++ b/src/main/java/dev/kodama/entity/lod/MobLod.java
+@@ -0,0 +1,111 @@
++package dev.kodama.entity.lod;
++
++import dev.kodama.feature.FeatureGuard;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Mob;
++
++/**
++ * Entry points of mob level of detail for the code that was patched into the game. Everything here is cheap when
++ * mob-lod is off, and a failure of the tier logic never reaches the caller: it is reported to the {@link FeatureGuard}.
++ */
++public final class MobLod {
++
++    public static final String FEATURE_ID = "mob-lod";
++
++    /**
++     * How long damage and right clicks keep a mob NEAR.
++     */
++    private static final int INTERACTION_PIN_TICKS = 10 * 20;
++
++    private MobLod() {
++    }
++
++    /**
++     * Whether the mob is simulated every tick by tier (NEAR or MID) instead of by Paper's activation range.
++     */
++    public static boolean isActive(final Mob mob) {
++        return mob.kodamaTier.isActive();
++    }
++
++    /**
++     * Part B plugs the coordinate-only simulation of FAR mobs in here.
++     */
++    public static boolean isFar(final Mob mob) {
++        return mob.kodamaTier == MobTier.FAR;
++    }
++
++    /**
++     * Plugin API that touches the AI of a mob (target, pathfinder, goals, awareness, look direction, leash): the mob is
++     * NEAR before the call returns and stays NEAR for {@code api-pin-seconds}. Plain data access must not call this.
++     * <p>
++     * Part B restores the state of a far-simulated mob here.
++     */
++    public static void touch(final Mob mob) {
++        try {
++            if (mob.level() instanceof ServerLevel level) {
++                final MobLodManager manager = level.kodamaMobLod;
++                if (manager.isActive()) {
++                    manager.promote(mob, manager.apiPinTicks());
++                }
++            }
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(FEATURE_ID, throwable);
++        }
++    }
++
++    /**
++     * Damage and player interaction.
++     */
++    public static void interacted(final Mob mob) {
++        if (mob.kodamaTier == MobTier.NEAR && mob.kodamaPinUntil >= net.minecraft.server.MinecraftServer.currentTick + INTERACTION_PIN_TICKS) {
++            return;
++        }
++        try {
++            if (mob.level() instanceof ServerLevel level) {
++                level.kodamaMobLod.promote(mob, INTERACTION_PIN_TICKS);
++            }
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(FEATURE_ID, throwable);
++        }
++    }
++
++    /**
++     * A plugin added or removed a goal: the mob is never reduced again, whatever the goal does.
++     */
++    public static void markCustomGoals(final Mob mob) {
++        mob.kodamaCustomGoals = true;
++        touch(mob);
++    }
++
++    /**
++     * Ticks between two goal selections of a MID mob; 1 for every other mob.
++     */
++    public static int aiInterval(final Mob mob) {
++        if (mob.kodamaTier != MobTier.MID || !(mob.level() instanceof ServerLevel level)) {
++            return 1;
++        }
++        return level.kodamaMobLod.midAiInterval();
++    }
++
++    /**
++     * Ticks between two new paths of a MID mob; 1 for every other mob.
++     */
++    public static int pathInterval(final Mob mob) {
++        if (mob.kodamaTier != MobTier.MID || !(mob.level() instanceof ServerLevel level)) {
++            return 1;
++        }
++        return level.kodamaMobLod.midPathInterval();
++    }
++
++    /**
++     * Whether a brain based mob ticks its brain in this tick.
++     */
++    public static boolean shouldTickBrain(final Mob mob) {
++        final int interval = aiInterval(mob);
++        return interval <= 1 || (mob.tickCount + (long)mob.getId()) % interval == 0L;
++    }
++}
+diff --git a/src/main/java/dev/kodama/entity/lod/MobLodManager.java b/src/main/java/dev/kodama/entity/lod/MobLodManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..aefbcbb97b27624ab3ffd1fe354c59e6505c9d92
+--- /dev/null
++++ b/src/main/java/dev/kodama/entity/lod/MobLodManager.java
+@@ -0,0 +1,257 @@
++package dev.kodama.entity.lod;
++
++import dev.kodama.feature.FeatureGuard;
++import java.util.List;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
++import net.minecraft.world.entity.boss.wither.WitherBoss;
++import net.minecraft.world.entity.monster.ElderGuardian;
++import net.minecraft.world.entity.monster.warden.Warden;
++import net.minecraft.world.entity.raid.Raider;
++import org.bukkit.craftbukkit.entity.CraftEntity;
++
++/**
++ * Assigns the {@link MobTier} of every mob of one level from its distance to the nearest player. Main thread only.
++ * <p>
++ * {@link #beginTick()} runs once per tick before the entities are ticked; {@link #update(Mob)} runs for each mob but
++ * only evaluates it every {@code update-interval} ticks, spread by entity id.
++ */
++public final class MobLodManager {
++
++    private static final int RECENTLY_HURT_TICKS = 100;
++
++    private final ServerLevel level;
++    final MobLodSettings settings = new MobLodSettings();
++    private final AfkTracker afk = new AfkTracker();
++    private boolean wasActive;
++
++    // players of this tick
++    private int playerCount;
++    private double[] playerX = new double[16];
++    private double[] playerY = new double[16];
++    private double[] playerZ = new double[16];
++    private boolean[] playerWaiting = new boolean[16];
++
++    public MobLodManager(final ServerLevel level) {
++        this.level = level;
++    }
++
++    /**
++     * Whether tiers are assigned in this level right now (enabled in the config and not switched off by the guard).
++     */
++    public boolean isActive() {
++        return this.settings.active;
++    }
++
++    public int midAiInterval() {
++        return this.settings.midAiInterval;
++    }
++
++    public int midPathInterval() {
++        return this.settings.midPathInterval;
++    }
++
++    public int apiPinTicks() {
++        return this.settings.apiPinTicks;
++    }
++
++    public void beginTick() {
++        final MobLodSettings s = this.settings;
++        s.refresh(this.level);
++        if (!s.active) {
++            if (this.wasActive) {
++                this.wasActive = false;
++                this.afk.clear();
++                for (final Entity entity : this.level.getAllEntities()) {
++                    if (entity instanceof Mob mob) {
++                        mob.kodamaTier = MobTier.OFF;
++                    }
++                }
++            }
++            return;
++        }
++        this.wasActive = true;
++
++        final List<ServerPlayer> players = this.level.players();
++        if (MinecraftServer.currentTick % AfkTracker.SAMPLE_TICKS == 0) {
++            this.afk.sample(players, s.afkTicks, s.afkMoveThreshold);
++        }
++        final boolean ignoreSpectators = this.level.spigotConfig.ignoreSpectatorActivation;
++        if (this.playerX.length < players.size()) {
++            final int size = players.size() + 8;
++            this.playerX = new double[size];
++            this.playerY = new double[size];
++            this.playerZ = new double[size];
++            this.playerWaiting = new boolean[size];
++        }
++        int count = 0;
++        for (int i = 0; i < players.size(); i++) {
++            final ServerPlayer player = players.get(i);
++            if (ignoreSpectators && player.isSpectator()) {
++                continue;
++            }
++            this.playerX[count] = player.getX();
++            this.playerY[count] = player.getY();
++            this.playerZ[count] = player.getZ();
++            this.playerWaiting[count] = this.afk.isWaiting(player);
++            count++;
++        }
++        this.playerCount = count;
++    }
++
++    public void update(final Mob mob) {
++        final MobLodSettings s = this.settings;
++        if (!s.active) {
++            return;
++        }
++        final int now = MinecraftServer.currentTick;
++        if ((mob.getId() + (long)now) % s.updateInterval != 0L) {
++            return;
++        }
++        try {
++            this.evaluate(mob, now);
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            mob.kodamaTier = MobTier.NEAR;
++            mob.kodamaForcedNear = true;
++            FeatureGuard.reportFailure(MobLod.FEATURE_ID, throwable);
++        }
++    }
++
++    private void evaluate(final Mob mob, final int now) {
++        final MobLodSettings s = this.settings;
++        if (mob.kodamaPinUntil > now) {
++            mob.kodamaTier = MobTier.NEAR;
++            return;
++        }
++        final boolean forced = mustBeNear(mob) || s.inExcludedArea(mob.getX(), mob.getZ());
++        mob.kodamaForcedNear = forced;
++        if (forced) {
++            mob.kodamaTier = MobTier.NEAR;
++            return;
++        }
++
++        final double distanceSquared = this.nearestPlayerSquared(mob);
++        MobTier tier = mob.kodamaTier == MobTier.OFF ? MobTier.NEAR : mob.kodamaTier;
++        if (tier == MobTier.NEAR && distanceSquared > s.nearEnterSquared) {
++            tier = MobTier.MID;
++        }
++        if (tier == MobTier.MID && distanceSquared > s.farEnterSquared) {
++            tier = MobTier.FAR;
++        }
++        if (tier == MobTier.FAR && distanceSquared < s.farLeaveSquared) {
++            tier = MobTier.MID;
++        }
++        if (tier == MobTier.MID && distanceSquared < s.nearLeaveSquared) {
++            tier = MobTier.NEAR;
++        }
++        if (tier == MobTier.FAR && (isEnvironmentProtected(mob) || this.isNearWaitingPlayer(mob))) {
++            tier = MobTier.MID;
++        }
++        mob.kodamaTier = tier;
++    }
++
++    private double nearestPlayerSquared(final Mob mob) {
++        final double x = mob.getX();
++        final double y = mob.getY();
++        final double z = mob.getZ();
++        double best = Double.POSITIVE_INFINITY;
++        for (int i = 0; i < this.playerCount; i++) {
++            final double dx = this.playerX[i] - x;
++            final double dy = this.playerY[i] - y;
++            final double dz = this.playerZ[i] - z;
++            final double d = dx * dx + dy * dy + dz * dz;
++            if (d < best) {
++                best = d;
++            }
++        }
++        return best;
++    }
++
++    private boolean isNearWaitingPlayer(final Mob mob) {
++        final double x = mob.getX();
++        final double y = mob.getY();
++        final double z = mob.getZ();
++        for (int i = 0; i < this.playerCount; i++) {
++            if (!this.playerWaiting[i]) {
++                continue;
++            }
++            final double dx = this.playerX[i] - x;
++            final double dy = this.playerY[i] - y;
++            final double dz = this.playerZ[i] - z;
++            if (dx * dx + dy * dy + dz * dz <= this.settings.afkRadiusSquared) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Mobs a plugin or the game relies on to behave exactly like vanilla.
++     */
++    private static boolean mustBeNear(final Mob mob) {
++        if (mob.kodamaCustomGoals || mob.kodamaPluginData || !mob.aware) {
++            return true;
++        }
++        if (mob.hasCustomName() || mob.isLeashed() || mob.isPassenger() || mob.isVehicle() || mob.getTarget() != null) {
++            return true;
++        }
++        if (mob instanceof EnderDragon || mob instanceof WitherBoss || mob instanceof Warden || mob instanceof ElderGuardian) {
++            return true;
++        }
++        if (mob instanceof Raider raider && raider.hasActiveRaid()) {
++            return true;
++        }
++        final CraftEntity bukkit = mob.getBukkitEntityRaw();
++        return bukkit != null && !bukkit.getPersistentDataContainer().isEmpty();
++    }
++
++    /**
++     * Mobs that are in fluid, in the air, climbing, falling or recently hurt are at most MID.
++     */
++    private static boolean isEnvironmentProtected(final Mob mob) {
++        if (mob.isInWater() || mob.isInLava() || !mob.onGround() || mob.onClimbable() || mob.fallDistance > 0.0F || mob.hurtTime > 0) {
++            return true;
++        }
++        return mob.getLastHurtByMob() != null && mob.tickCount - mob.getLastHurtByMobTimestamp() < RECENTLY_HURT_TICKS;
++    }
++
++    /**
++     * Moves the mob to NEAR immediately and keeps it there for {@code pinTicks}.
++     */
++    public void promote(final Mob mob, final int pinTicks) {
++        if (!this.settings.active) {
++            return;
++        }
++        final int until = MinecraftServer.currentTick + pinTicks;
++        if (until > mob.kodamaPinUntil) {
++            mob.kodamaPinUntil = until;
++        }
++        mob.kodamaTier = MobTier.NEAR;
++    }
++
++    /**
++     * Tier counts of this level for {@code /kodama status}: unassigned, near, mid, far, pinned, excluded.
++     */
++    public int[] count() {
++        final int[] result = new int[6];
++        final int now = MinecraftServer.currentTick;
++        for (final Entity entity : this.level.getAllEntities()) {
++            if (entity instanceof Mob mob) {
++                result[mob.kodamaTier.ordinal()]++;
++                if (mob.kodamaPinUntil > now) {
++                    result[4]++;
++                }
++                if (mob.kodamaForcedNear) {
++                    result[5]++;
++                }
++            }
++        }
++        return result;
++    }
++}
+diff --git a/src/main/java/dev/kodama/entity/lod/MobLodSettings.java b/src/main/java/dev/kodama/entity/lod/MobLodSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f893f1cdb3d4caddb7b3b88159a107b9cec6d72b
+--- /dev/null
++++ b/src/main/java/dev/kodama/entity/lod/MobLodSettings.java
+@@ -0,0 +1,95 @@
++package dev.kodama.entity.lod;
++
++import dev.kodama.config.KodamaWorldConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import java.util.List;
++import net.minecraft.server.level.ServerLevel;
++
++/**
++ * Snapshot of the {@code mob-lod} world section, refreshed once per tick by {@link MobLodManager}, with the master
++ * switch and the {@link FeatureGuard} state already applied. Distances are stored squared.
++ */
++final class MobLodSettings {
++
++    boolean active;
++    int nearDistance;
++    int farDistance;
++    int hysteresis;
++    double nearEnterSquared; // farther than this: leave NEAR
++    double nearLeaveSquared; // closer than this: back to NEAR
++    double farEnterSquared;
++    double farLeaveSquared;
++    int updateInterval = 10;
++    int midAiInterval = 1;
++    int midPathInterval = 1;
++    int afkTicks;
++    double afkMoveThreshold;
++    double afkRadiusSquared;
++    int apiPinTicks;
++
++    // excluded areas as parallel arrays; rebuilt only when the configured list changes
++    private List<KodamaWorldConfiguration.MobLod.ExcludedArea> areaSource;
++    double[] areaX = new double[0];
++    double[] areaZ = new double[0];
++    double[] areaRadiusSquared = new double[0];
++
++    void refresh(final ServerLevel level) {
++        final KodamaWorldConfiguration config = level.kodamaConfig();
++        final KodamaWorldConfiguration.MobLod section = config == null ? null : config.mobLod;
++        if (section == null || !section.enabled.isTrue() || FeatureGuard.isTripped(MobLod.FEATURE_ID)) {
++            this.active = false;
++            return;
++        }
++        final int near = section.nearDistance.getAsInt();
++        if (near <= 0) {
++            this.active = false; // 0 is how the safe preset turns the feature off
++            return;
++        }
++        this.active = true;
++        final int far = Math.max(near + 1, section.farDistance.getAsInt());
++        final int margin = Math.max(0, Math.min(section.hysteresis.getAsInt(), near / 2));
++        this.nearDistance = near;
++        this.farDistance = far;
++        this.hysteresis = margin;
++        this.nearEnterSquared = square(near + margin);
++        this.nearLeaveSquared = square(near - margin);
++        this.farEnterSquared = square(far + margin);
++        this.farLeaveSquared = square(far - margin);
++        this.updateInterval = Math.max(1, section.updateInterval);
++        this.midAiInterval = Math.max(1, section.midAiInterval.getAsInt());
++        this.midPathInterval = Math.max(1, section.midPathInterval.getAsInt());
++        this.afkTicks = Math.max(1, section.afkSeconds) * 20;
++        this.afkMoveThreshold = Math.max(0.0, section.afkMoveThreshold);
++        this.afkRadiusSquared = square(Math.max(0, section.afkRadius));
++        this.apiPinTicks = Math.max(0, section.apiPinSeconds) * 20;
++
++        if (section.excludedAreas != this.areaSource) {
++            this.areaSource = section.excludedAreas;
++            final int size = this.areaSource == null ? 0 : this.areaSource.size();
++            this.areaX = new double[size];
++            this.areaZ = new double[size];
++            this.areaRadiusSquared = new double[size];
++            for (int i = 0; i < size; i++) {
++                final KodamaWorldConfiguration.MobLod.ExcludedArea area = this.areaSource.get(i);
++                this.areaX[i] = area.x();
++                this.areaZ[i] = area.z();
++                this.areaRadiusSquared[i] = square(Math.max(0.0, area.radius()));
++            }
++        }
++    }
++
++    boolean inExcludedArea(final double x, final double z) {
++        for (int i = 0; i < this.areaX.length; i++) {
++            final double dx = x - this.areaX[i];
++            final double dz = z - this.areaZ[i];
++            if (dx * dx + dz * dz <= this.areaRadiusSquared[i]) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private static double square(final double value) {
++        return value * value;
++    }
++}
+diff --git a/src/main/java/dev/kodama/entity/lod/MobLodStatus.java b/src/main/java/dev/kodama/entity/lod/MobLodStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..65ad387f130c94f29f79a1062a95ea55b4725049
+--- /dev/null
++++ b/src/main/java/dev/kodama/entity/lod/MobLodStatus.java
+@@ -0,0 +1,47 @@
++package dev.kodama.entity.lod;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.TextComponent;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++/**
++ * The {@code Mob tiers} line of {@code /kodama status}.
++ */
++public final class MobLodStatus {
++
++    private MobLodStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Mob tiers";
++            }
++
++            @Override
++            public Component describe() {
++                TextComponent result = text("");
++                for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                    result = result.append(text("\n  " + level.getWorld().getName() + ": ", WHITE));
++                    if (!level.kodamaMobLod.isActive()) {
++                        result = result.append(text("off", GRAY));
++                        continue;
++                    }
++                    final int[] count = level.kodamaMobLod.count();
++                    result = result.append(text("NEAR " + count[MobTier.NEAR.ordinal()] + ", MID " + count[MobTier.MID.ordinal()]
++                        + ", FAR " + count[MobTier.FAR.ordinal()] + ", not yet assigned " + count[MobTier.OFF.ordinal()]
++                        + " (pinned " + count[4] + ", excluded " + count[5] + ")", GRAY));
++                }
++                return result;
++            }
++        });
++    }
++}
+diff --git a/src/main/java/dev/kodama/entity/lod/MobTier.java b/src/main/java/dev/kodama/entity/lod/MobTier.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bc7e209a4290f983d0f627bbbbb15126839583f
+--- /dev/null
++++ b/src/main/java/dev/kodama/entity/lod/MobTier.java
+@@ -0,0 +1,19 @@
++package dev.kodama.entity.lod;
++
++/**
++ * Level of detail of one mob. {@link #OFF} means the mob is not managed (mob-lod is off in its world, or the mob has not
++ * been evaluated yet); it is handled exactly like Paper does.
++ */
++public enum MobTier {
++    OFF,
++    /** Fully vanilla; never inactive. */
++    NEAR,
++    /** Vanilla physics, reduced AI; never inactive. */
++    MID,
++    /** Handled like Paper's activation range does until the coordinate-only simulation exists. */
++    FAR;
++
++    public boolean isActive() {
++        return this == NEAR || this == MID;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index e9aab7539b1af9aa09ff8ed74e8607d0d5b4f2c4..a82136433f6f1dda030b0ce692f27f7e00fd6305 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -521,6 +521,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     // Paper end - rewrite chunk system
+ 
+     public final io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader playerChunkLoader = new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader(this);
++    public final dev.kodama.entity.lod.MobLodManager kodamaMobLod = new dev.kodama.entity.lod.MobLodManager(this); // Kodama - mob-lod
+     private final java.util.concurrent.atomic.AtomicReference<io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances> viewDistances = new java.util.concurrent.atomic.AtomicReference<>(new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances(-1, -1, -1));
+ 
+     public io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances getViewDistances() {
+@@ -898,12 +899,14 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+ 
+             org.spigotmc.ActivationRange.activateEntities(this); // Spigot
++            this.kodamaMobLod.beginTick(); // Kodama - mob-lod
+             this.timings.entityTick.startTiming(); // Spigot
+             this.entityTickList.forEach((entity) -> {
+                 if (!entity.isRemoved()) {
+                     if (false && this.shouldDiscardEntity(entity)) { // CraftBukkit - We prevent spawning in general, so this butchering is not needed
+                         entity.discard();
+                     } else if (!tickratemanager.isEntityFrozen(entity)) {
++                        if (entity instanceof Mob lodMob) { this.kodamaMobLod.update(lodMob); } // Kodama - mob-lod
+                         gameprofilerfiller.push("checkDespawn");
+                         entity.checkDespawn();
+                         gameprofilerfiller.pop();
+diff --git a/src/main/java/net/minecraft/world/entity/LivingEntity.java b/src/main/java/net/minecraft/world/entity/LivingEntity.java
+index 015134a614a44b610aac1a4c6a1eb6b7b5bb96b5..115f646f0246ef05d3a64b17c68b2e8badfd4119 100644
+--- a/src/main/java/net/minecraft/world/entity/LivingEntity.java
++++ b/src/main/java/net/minecraft/world/entity/LivingEntity.java
+@@ -1433,6 +1433,7 @@ public abstract class LivingEntity extends Entity implements Attackable {
+ 
+     @Override
+     public boolean hurt(DamageSource source, float amount) {
++        if (this instanceof Mob lodMob) { dev.kodama.entity.lod.MobLod.interacted(lodMob); } // Kodama - mob-lod
+         if (this.isInvulnerableTo(source)) {
+             return false;
+         } else if (this.level().isClientSide) {
+diff --git a/src/main/java/net/minecraft/world/entity/Mob.java b/src/main/java/net/minecraft/world/entity/Mob.java
+index 815035a4fcd6eff0a5ae22d197d5afe8c87a5a62..06a0bd3b98e13c1975922f603a27275b903aae68 100644
+--- a/src/main/java/net/minecraft/world/entity/Mob.java
++++ b/src/main/java/net/minecraft/world/entity/Mob.java
+@@ -152,6 +152,13 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Targeti
+     private float restrictRadius;
+ 
+     public boolean aware = true; // CraftBukkit
++    // Kodama start - mob-lod
++    public dev.kodama.entity.lod.MobTier kodamaTier = dev.kodama.entity.lod.MobTier.OFF;
++    public boolean kodamaCustomGoals; // a plugin added or removed a goal
++    public boolean kodamaPluginData; // a plugin attached Bukkit metadata
++    public boolean kodamaForcedNear; // excluded from level of detail at the last evaluation
++    public int kodamaPinUntil; // MinecraftServer.currentTick until which the mob stays NEAR
++    // Kodama end - mob-lod
+ 
+     protected Mob(EntityType<? extends Mob> type, Level world) {
+         super(type, world);
+@@ -966,12 +973,18 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Targeti
+         // Paper end - Allow nerfed mobs to jump and float
+         ProfilerFiller gameprofilerfiller = this.level().getProfiler();
+ 
++        // Kodama start - mob-lod - MID mobs choose goals and sense only every few ticks, goals that run keep ticking
++        final int lodInterval = dev.kodama.entity.lod.MobLod.aiInterval(this);
++        int i = this.tickCount + this.getId();
++        final boolean lodRunningOnly = lodInterval > 1 ? (i % lodInterval != 0 && this.tickCount > 1) : (i % 2 != 0 && this.tickCount > 1);
+         gameprofilerfiller.push("sensing");
+-        this.sensing.tick();
++        if (!(lodInterval > 1 && lodRunningOnly)) {
++            this.sensing.tick();
++        }
+         gameprofilerfiller.pop();
+-        int i = this.tickCount + this.getId();
++        // Kodama end - mob-lod
+ 
+-        if (i % 2 != 0 && this.tickCount > 1) {
++        if (lodRunningOnly) { // Kodama - mob-lod
+             gameprofilerfiller.push("targetSelector");
+             this.targetSelector.tickRunningGoals(false);
+             gameprofilerfiller.pop();
+@@ -1448,6 +1461,7 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Targeti
+ 
+     @Override
+     public final InteractionResult interact(Player player, InteractionHand hand) {
++        dev.kodama.entity.lod.MobLod.interacted(this); // Kodama - mob-lod
+         if (!this.isAlive()) {
+             return InteractionResult.PASS;
+         } else if (this.getLeashHolder() == player) {
+diff --git a/src/main/java/net/minecraft/world/entity/ai/navigation/PathNavigation.java b/src/main/java/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+index 17ec7691a251c756042c8684c93ac6d034ccdcf5..f6e1fcd03f844c0169e1a657e624d65eedcff60e 100644
+--- a/src/main/java/net/minecraft/world/entity/ai/navigation/PathNavigation.java
++++ b/src/main/java/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -158,7 +158,12 @@ public abstract class PathNavigation {
+        // Kaiiju end
+         } else if (this.path != null && !this.path.isDone() && positions.contains(this.targetPos)) {
+             return this.path;
++        // Kodama start - mob-lod
++        } else if (this.kodamaThrottlesPath(positions)) {
++            return this.path != null && !this.path.isDone() ? this.path : null;
++        // Kodama end - mob-lod
+         } else {
++            this.kodamaLastNewPathTick = this.level.getGameTime(); // Kodama - mob-lod
+             // Paper start - EntityPathfindEvent
+             boolean copiedSet = false;
+             for (BlockPos possibleTarget : positions) {
+@@ -210,6 +215,30 @@ public abstract class PathNavigation {
+         }
+     }
+ 
++    // Kodama start - mob-lod
++    private long kodamaLastNewPathTick = Long.MIN_VALUE / 2;
++
++    /**
++     * A MID mob calculates a new path at most every mid-path-interval ticks, and keeps the current one while the new
++     * target is at most one block away from the old one.
++     */
++    private boolean kodamaThrottlesPath(final Set<BlockPos> positions) {
++        final int interval = dev.kodama.entity.lod.MobLod.pathInterval(this.mob);
++        if (interval <= 1) {
++            return false;
++        }
++        final BlockPos current = this.targetPos;
++        if (current != null && this.path != null && !this.path.isDone()) {
++            for (final BlockPos position : positions) {
++                if (Math.abs(position.getX() - current.getX()) <= 1 && Math.abs(position.getY() - current.getY()) <= 1 && Math.abs(position.getZ() - current.getZ()) <= 1) {
++                    return true;
++                }
++            }
++        }
++        return this.level.getGameTime() - this.kodamaLastNewPathTick < interval;
++    }
++    // Kodama end - mob-lod
++
+     public boolean moveTo(double x, double y, double z, double speed) {
+         return this.moveTo(this.createPath(x, y, z, 1), speed);
+     }
+diff --git a/src/main/java/net/minecraft/world/entity/animal/allay/Allay.java b/src/main/java/net/minecraft/world/entity/animal/allay/Allay.java
+index 991e3274091c4e25eebc6debd44653e5b566eedb..2a4825eb85e6f0774e81dd4e03e8b816b0314bab 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/allay/Allay.java
++++ b/src/main/java/net/minecraft/world/entity/animal/allay/Allay.java
+@@ -218,7 +218,7 @@ public class Allay extends PathfinderMob implements InventoryCarrier, VibrationS
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("allayBrain");
+-        this.getBrain().tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("allayActivityUpdate");
+         AllayAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/armadillo/Armadillo.java b/src/main/java/net/minecraft/world/entity/animal/armadillo/Armadillo.java
+index b38281f963377cc82b360e8457da7cad033b8c36..3f62bc4cc9c3735ff2c6d4d1474b47fdf5913cd4 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/armadillo/Armadillo.java
++++ b/src/main/java/net/minecraft/world/entity/animal/armadillo/Armadillo.java
+@@ -131,7 +131,7 @@ public class Armadillo extends Animal {
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("armadilloBrain");
+-        ((Brain<Armadillo>) this.brain).tick((ServerLevel) this.level(), this); // CraftBukkit - decompile error
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) ((Brain<Armadillo>) this.brain).tick((ServerLevel) this.level(), this); // CraftBukkit - decompile error // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("armadilloActivityUpdate");
+         ArmadilloAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/axolotl/Axolotl.java b/src/main/java/net/minecraft/world/entity/animal/axolotl/Axolotl.java
+index a8cc6ddbf45370fe632e5c5fb7ceef3d299e62a4..d5acc5d7b5d8d15f2e905e47d33c47d99b5419c6 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/axolotl/Axolotl.java
++++ b/src/main/java/net/minecraft/world/entity/animal/axolotl/Axolotl.java
+@@ -271,7 +271,7 @@ public class Axolotl extends Animal implements LerpingModel, VariantHolder<Axolo
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("axolotlBrain");
+-        this.getBrain().tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("axolotlActivityUpdate");
+         AxolotlAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/camel/Camel.java b/src/main/java/net/minecraft/world/entity/animal/camel/Camel.java
+index 4eb26874f21726bbc6e6ad78bfaf4ecd268c7246..65a854fa84d5d7c37bb5eb12633720e8779393a2 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/camel/Camel.java
++++ b/src/main/java/net/minecraft/world/entity/animal/camel/Camel.java
+@@ -143,7 +143,7 @@ public class Camel extends AbstractHorse implements PlayerRideableJumping, Saddl
+         this.level().getProfiler().push("camelBrain");
+         Brain<Camel> behaviorcontroller = (Brain<Camel>) this.getBrain(); // CraftBukkit - decompile error
+ 
+-        behaviorcontroller.tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) behaviorcontroller.tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("camelActivityUpdate");
+         CamelAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/frog/Frog.java b/src/main/java/net/minecraft/world/entity/animal/frog/Frog.java
+index cdd3d4b8fdd4433cf9b236e9fb1acb97b1cb1c5c..c52c8bfc68c799ac4f744b775d73591313698b45 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/frog/Frog.java
++++ b/src/main/java/net/minecraft/world/entity/animal/frog/Frog.java
+@@ -184,7 +184,7 @@ public class Frog extends Animal implements VariantHolder<Holder<FrogVariant>> {
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("frogBrain");
+-        this.getBrain().tick((ServerLevel)this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel)this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("frogActivityUpdate");
+         FrogAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/frog/Tadpole.java b/src/main/java/net/minecraft/world/entity/animal/frog/Tadpole.java
+index 290d41136f5ec7671bc4990dfe50da0a770c124d..7a0efe6ab65af576d513a815c53ae23506975b5c 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/frog/Tadpole.java
++++ b/src/main/java/net/minecraft/world/entity/animal/frog/Tadpole.java
+@@ -86,7 +86,7 @@ public class Tadpole extends AbstractFish {
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("tadpoleBrain");
+-        this.getBrain().tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("tadpoleActivityUpdate");
+         TadpoleAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/goat/Goat.java b/src/main/java/net/minecraft/world/entity/animal/goat/Goat.java
+index 376bcbc189008464f4d518c1e07643431ba96306..fbd6cd3685824961634b7481a5f4d4a19af37032 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/goat/Goat.java
++++ b/src/main/java/net/minecraft/world/entity/animal/goat/Goat.java
+@@ -193,7 +193,7 @@ public class Goat extends Animal {
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("goatBrain");
+-        this.getBrain().tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         this.level().getProfiler().push("goatActivityUpdate");
+         GoatAi.updateActivity(this);
+diff --git a/src/main/java/net/minecraft/world/entity/animal/sniffer/Sniffer.java b/src/main/java/net/minecraft/world/entity/animal/sniffer/Sniffer.java
+index dc035bf94c5f6574ed8ad369b327b7f7a145e1d6..49dcf8e9ae946a42d0cbb0bfde64414b03997ad4 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/sniffer/Sniffer.java
++++ b/src/main/java/net/minecraft/world/entity/animal/sniffer/Sniffer.java
+@@ -478,7 +478,7 @@ public class Sniffer extends Animal {
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("snifferBrain");
+-        this.getBrain().tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().popPush("snifferActivityUpdate");
+         SnifferAi.updateActivity(this);
+         this.level().getProfiler().pop();
+diff --git a/src/main/java/net/minecraft/world/entity/monster/hoglin/Hoglin.java b/src/main/java/net/minecraft/world/entity/monster/hoglin/Hoglin.java
+index c583d883118ded5e1884c757427dc5e73c10dd27..f7245025239818baac60b5535b50088ef56d91de 100644
+--- a/src/main/java/net/minecraft/world/entity/monster/hoglin/Hoglin.java
++++ b/src/main/java/net/minecraft/world/entity/monster/hoglin/Hoglin.java
+@@ -156,7 +156,7 @@ public class Hoglin extends Animal implements Enemy, HoglinBase {
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("hoglinBrain");
+-        this.getBrain().tick((ServerLevel)this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel)this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         HoglinAi.updateActivity(this);
+         if (this.isConverting()) {
+diff --git a/src/main/java/net/minecraft/world/entity/monster/piglin/Piglin.java b/src/main/java/net/minecraft/world/entity/monster/piglin/Piglin.java
+index a8ab486c7e11ec137da48174af6f1030dfd48056..bb7ea4c02abd56d3b40606567c4d38c3d137b9c3 100644
+--- a/src/main/java/net/minecraft/world/entity/monster/piglin/Piglin.java
++++ b/src/main/java/net/minecraft/world/entity/monster/piglin/Piglin.java
+@@ -297,7 +297,7 @@ public class Piglin extends AbstractPiglin implements CrossbowAttackMob, Invento
+     @Override
+     protected void customServerAiStep() {
+         this.level().getProfiler().push("piglinBrain");
+-        this.getBrain().tick((ServerLevel) this.level(), this);
++        if (dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         PiglinAi.updateActivity(this);
+         super.customServerAiStep();
+diff --git a/src/main/java/net/minecraft/world/entity/npc/Villager.java b/src/main/java/net/minecraft/world/entity/npc/Villager.java
+index a7930f9875aa4aca997caaead46ecdc21e5e11d7..125cbbbd7a08ab33f3928370981be9fb48f947db 100644
+--- a/src/main/java/net/minecraft/world/entity/npc/Villager.java
++++ b/src/main/java/net/minecraft/world/entity/npc/Villager.java
+@@ -255,7 +255,7 @@ public class Villager extends AbstractVillager implements ReputationEventHandler
+     protected void customServerAiStep(final boolean inactive) {
+         // Paper end
+         this.level().getProfiler().push("villagerBrain");
+-        if (!inactive) this.getBrain().tick((ServerLevel) this.level(), this); // Paper
++        if (!inactive && dev.kodama.entity.lod.MobLod.shouldTickBrain(this)) this.getBrain().tick((ServerLevel) this.level(), this); // Paper // Kodama - mob-lod
+         this.level().getProfiler().pop();
+         if (this.assignProfessionWhenSpawned) {
+             this.assignProfessionWhenSpawned = false;
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index a2d336ceb52b63db5c03432ee7bc94dc6a742b82..05cd4027e2b67c8cdbba22703a07011873d7abf2 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -571,6 +571,7 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+ 
+     @Override
+     public void setMetadata(String metadataKey, MetadataValue newMetadataValue) {
++        if (this.entity instanceof net.minecraft.world.entity.Mob lodMob) { lodMob.kodamaPluginData = true; dev.kodama.entity.lod.MobLod.touch(lodMob); } // Kodama - mob-lod
+         this.server.getEntityMetadata().setMetadata(this, metadataKey, newMetadataValue);
+     }
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+index 541c256e4e834da3915023db20235587a0d2259f..563b60a9e07bc23c01adb4ae423e756bec7db401 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+@@ -785,6 +785,7 @@ public class CraftLivingEntity extends CraftEntity implements LivingEntity {
+         }
+ 
+         this.unleash();
++        dev.kodama.entity.lod.MobLod.touch((Mob) this.getHandle()); // Kodama - mob-lod
+         ((Mob) this.getHandle()).setLeashedTo(((CraftEntity) holder).getHandle(), true);
+         return true;
+     }
+@@ -841,12 +842,14 @@ public class CraftLivingEntity extends CraftEntity implements LivingEntity {
+     @Override
+     public void setAI(boolean ai) {
+         if (this.getHandle() instanceof Mob) {
++            dev.kodama.entity.lod.MobLod.touch((Mob) this.getHandle()); // Kodama - mob-lod
+             ((Mob) this.getHandle()).setNoAi(!ai);
+         }
+     }
+ 
+     @Override
+     public boolean hasAI() {
++        if (this.getHandle() instanceof Mob) { dev.kodama.entity.lod.MobLod.touch((Mob) this.getHandle()); } // Kodama - mob-lod
+         return (this.getHandle() instanceof Mob) ? !((Mob) this.getHandle()).isNoAi() : false;
+     }
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftMob.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftMob.java
+index e155501fb3a88edf3ddac3aa0aae1b6a5a84962e..d54e94ad8f53b449a916463c306e19b8866766d8 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftMob.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftMob.java
+@@ -17,10 +17,11 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+     }
+ 
+     private final com.destroystokyo.paper.entity.PaperPathfinder paperPathfinder; // Paper - Mob Pathfinding API
+-    @Override public com.destroystokyo.paper.entity.Pathfinder getPathfinder() { return paperPathfinder; } // Paper - Mob Pathfinding API
++    @Override public com.destroystokyo.paper.entity.Pathfinder getPathfinder() { dev.kodama.entity.lod.MobLod.touch(this.getHandle()); return paperPathfinder; } // Paper - Mob Pathfinding API // Kodama - mob-lod
+     @Override
+     public void setTarget(LivingEntity target) {
+         Preconditions.checkState(!this.getHandle().generation, "Cannot set target during world generation");
++        dev.kodama.entity.lod.MobLod.touch(this.getHandle()); // Kodama - mob-lod
+ 
+         net.minecraft.world.entity.Mob entity = this.getHandle();
+         if (target == null) {
+@@ -32,6 +33,7 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public CraftLivingEntity getTarget() {
++        dev.kodama.entity.lod.MobLod.touch(this.getHandle()); // Kodama - mob-lod
+         if (this.getHandle().getTarget() == null) return null;
+ 
+         return (CraftLivingEntity) this.getHandle().getTarget().getBukkitEntity();
+@@ -39,11 +41,13 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public void setAware(boolean aware) {
++        dev.kodama.entity.lod.MobLod.touch(this.getHandle()); // Kodama - mob-lod
+         this.getHandle().aware = aware;
+     }
+ 
+     @Override
+     public boolean isAware() {
++        dev.kodama.entity.lod.MobLod.touch(this.getHandle()); // Kodama - mob-lod
+         return this.getHandle().aware;
+     }
+ 
+@@ -99,6 +103,7 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public void lookAt(@org.jetbrains.annotations.NotNull org.bukkit.Location location) {
++        dev.kodama.entity.lod.MobLod.touch(getHandle()); // Kodama - mob-lod
+         com.google.common.base.Preconditions.checkNotNull(location, "location cannot be null");
+         com.google.common.base.Preconditions.checkArgument(location.getWorld().equals(getWorld()), "location in a different world");
+         getHandle().getLookControl().setLookAt(location.getX(), location.getY(), location.getZ());
+@@ -106,6 +111,7 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public void lookAt(@org.jetbrains.annotations.NotNull org.bukkit.Location location, float headRotationSpeed, float maxHeadPitch) {
++        dev.kodama.entity.lod.MobLod.touch(getHandle()); // Kodama - mob-lod
+         com.google.common.base.Preconditions.checkNotNull(location, "location cannot be null");
+         com.google.common.base.Preconditions.checkArgument(location.getWorld().equals(getWorld()), "location in a different world");
+         getHandle().getLookControl().setLookAt(location.getX(), location.getY(), location.getZ(), headRotationSpeed, maxHeadPitch);
+@@ -113,6 +119,7 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public void lookAt(@org.jetbrains.annotations.NotNull org.bukkit.entity.Entity entity) {
++        dev.kodama.entity.lod.MobLod.touch(getHandle()); // Kodama - mob-lod
+         com.google.common.base.Preconditions.checkNotNull(entity, "entity cannot be null");
+         com.google.common.base.Preconditions.checkArgument(entity.getWorld().equals(getWorld()), "entity in a different world");
+         getHandle().getLookControl().setLookAt(((CraftEntity) entity).getHandle());
+@@ -120,6 +127,7 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public void lookAt(@org.jetbrains.annotations.NotNull org.bukkit.entity.Entity entity, float headRotationSpeed, float maxHeadPitch) {
++        dev.kodama.entity.lod.MobLod.touch(getHandle()); // Kodama - mob-lod
+         com.google.common.base.Preconditions.checkNotNull(entity, "entity cannot be null");
+         com.google.common.base.Preconditions.checkArgument(entity.getWorld().equals(getWorld()), "entity in a different world");
+         getHandle().getLookControl().setLookAt(((CraftEntity) entity).getHandle(), headRotationSpeed, maxHeadPitch);
+@@ -127,11 +135,13 @@ public abstract class CraftMob extends CraftLivingEntity implements Mob {
+ 
+     @Override
+     public void lookAt(double x, double y, double z) {
++        dev.kodama.entity.lod.MobLod.touch(getHandle()); // Kodama - mob-lod
+         getHandle().getLookControl().setLookAt(x, y, z);
+     }
+ 
+     @Override
+     public void lookAt(double x, double y, double z, float headRotationSpeed, float maxHeadPitch) {
++        dev.kodama.entity.lod.MobLod.touch(getHandle()); // Kodama - mob-lod
+         getHandle().getLookControl().setLookAt(x, y, z, headRotationSpeed, maxHeadPitch);
+     }
+ 
+diff --git a/src/main/java/org/spigotmc/ActivationRange.java b/src/main/java/org/spigotmc/ActivationRange.java
+index 08bae79a7e2bd592f032c154e8c8016b68fa93c4..54e9ec19d1d1a9d7fdb2b5a42f3770a8f9448bff 100644
+--- a/src/main/java/org/spigotmc/ActivationRange.java
++++ b/src/main/java/org/spigotmc/ActivationRange.java
+@@ -383,6 +383,12 @@ public class ActivationRange
+         if ( entity instanceof FireworkRocketEntity ) {
+             return true;
+         }
++        // Kodama start - mob-lod - the tier of a NEAR or MID mob decides instead of the activation range
++        if (entity instanceof Mob lodMob && dev.kodama.entity.lod.MobLod.isActive(lodMob)) {
++            entity.isTemporarilyActive = false;
++            return true;
++        }
++        // Kodama end - mob-lod
+         // Paper start - special case always immunities
+         // immunize brand new entities, dead entities, and portal scenarios
+         if (entity.defaultActivationState || entity.tickCount < 20*10 || !entity.isAlive() || entity.isInsidePortal || entity.portalCooldown > 0) {
