@@ -24,6 +24,15 @@ Requires JDK 21 and Git.
 
 The server jar is written to `build/libs/kodama-paperclip-<version>-mojmap.jar`.
 
+## Running
+
+`scripts/start.sh` (Linux / macOS) and `scripts/start.bat` or `scripts/start.ps1` (Windows) start the
+server with the recommended JVM flags. Copy the script next to the server jar.
+
+- `MEMORY` / `-Memory`: heap size (default `4G`)
+- `GC` / `-Gc`: `g1` (default, Aikar's flags) or `zgc` (generational ZGC)
+- Compact Object Headers are turned on with JDK 24 or newer (JDK 25 is recommended)
+
 ## Working with patches
 
 - `kodama-api/` and `kodama-server/` are generated from `patches/` and are not tracked.
