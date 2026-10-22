@@ -121,6 +121,9 @@ function saveDownloadCache(dir, flavor) {
  * `exit` always resolves with { code, timedOut }.
  */
 export function startServer(o) {
+  // A running server keeps its jar open, which on Windows makes the next gradle build fail to replace it.
+  const jar = join(o.dir, 'server.jar');
+  cpSync(o.jar, jar);
   const args = [
     `-Xms${o.heap}`,
     `-Xmx${o.heap}`,
@@ -130,7 +133,7 @@ export function startServer(o) {
     ...Object.entries(o.sysProps ?? {}).map(([k, v]) => `-D${k}=${v}`),
     ...(o.jvmArgs ?? []),
     '-jar',
-    o.jar,
+    jar,
     '--nogui',
   ];
   const logPath = join(o.dir, 'console.log');

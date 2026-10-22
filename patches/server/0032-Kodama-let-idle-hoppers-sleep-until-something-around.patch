@@ -1,0 +1,522 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 07:26:00 +0900
+Subject: [PATCH] Kodama: let idle hoppers sleep until something around them
+ changes
+
+
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+index dec60428976db7dcd8c6773bb1afc8bfc846cc1a..f003a30d059158f4484e9da8e9d48fe4ac5c452d 100644
+--- a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -52,6 +52,7 @@ public final class StatusCommand extends PermissionedKodamaSubcommand {
+         dev.kodama.entity.lod.MobLodStatus.register();
+         dev.kodama.network.NetworkStatus.register();
+         dev.kodama.redstone.RedstoneStatus.register();
++        dev.kodama.hopper.HopperStatus.register();
+     }
+ 
+     public StatusCommand() {
+diff --git a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+index 97eed5fb0c5d8273448df598cb44f7bd0bf15935..703378e68aea497644630ced353b3beae307f8af 100644
+--- a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+@@ -109,7 +109,12 @@ public class KodamaWorldConfiguration extends ConfigurationPart {
+     public Hoppers hoppers;
+ 
+     public class Hoppers extends ConfigurationPart {
+-        @Comment("Enables the hopper optimizations in this world.")
++        @Comment("Enables the hopper optimizations in this world. Master switch of every option below.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++        @Comment("Hoppers that could not move anything stop searching until a block, inventory or item entity around them changes.\n"
++            + "Items move in the same ticks as without it. Off while a plugin listens to InventoryMoveItemEvent, InventoryPickupItemEvent\n"
++            + "or HopperInventorySearchEvent, and while hopper-check in spigot.yml is above 1.")
++        public PresetBoolean idleSleep = PresetBoolean.of(false, true, true);
+     }
+ }
+diff --git a/src/main/java/dev/kodama/hopper/HopperSleep.java b/src/main/java/dev/kodama/hopper/HopperSleep.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b436010ac32e8b0a62769e86e89dd34e2f5afef
+--- /dev/null
++++ b/src/main/java/dev/kodama/hopper/HopperSleep.java
+@@ -0,0 +1,272 @@
++package dev.kodama.hopper;
++
++import dev.kodama.config.KodamaWorldConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.world.ChunkEntitySlices;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
++import java.util.ArrayList;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.core.SectionPos;
++import net.minecraft.server.level.FullChunkStatus;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.Container;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.item.ItemEntity;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.block.ChestBlock;
++import net.minecraft.world.level.block.HopperBlock;
++import net.minecraft.world.level.block.entity.HopperBlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.block.state.properties.ChestType;
++import org.bukkit.event.inventory.HopperInventorySearchEvent;
++import org.bukkit.event.inventory.InventoryMoveItemEvent;
++import org.bukkit.event.inventory.InventoryPickupItemEvent;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Idle hoppers of one world that skip their transfer attempt until something they depend on changes.
++ * <p>
++ * A hopper falls asleep after an attempt that moved nothing. While it sleeps it still ticks (cooldown and the game time
++ * that other hoppers compare against), but instead of searching it sets the cooldown the failed attempt left, which is
++ * what the same attempt would do again on an unchanged world. It wakes, and runs the vanilla attempt in that same tick,
++ * when one of these changes:
++ * <ul>
++ * <li>a block state or block entity at the hopper, the block above, the block it faces, or the other half of a double
++ * chest there;</li>
++ * <li>an item entity or container entity (minecart, chest boat) enters an entity section the vanilla search could look
++ * into;</li>
++ * <li>the entity status of a chunk in that range (load, unload);</li>
++ * <li>a plugin opens one of those inventories through the Bukkit API.</li>
++ * </ul>
++ * A hopper only falls asleep when no item or container entity is in that range and every chunk of it is fully loaded,
++ * and never while a plugin listens to the hopper events, so plugins see every attempt like on Paper. Main thread only.
++ */
++public final class HopperSleep {
++
++    public static final String FEATURE_ID = "hopper-sleep";
++
++    private final ServerLevel level;
++    private boolean active;
++    private final Long2ObjectOpenHashMap<ReferenceArrayList<HopperBlockEntity>> byBlock = new Long2ObjectOpenHashMap<>();
++    private final Long2ObjectOpenHashMap<ReferenceArrayList<HopperBlockEntity>> bySection = new Long2ObjectOpenHashMap<>();
++    private final Long2ObjectOpenHashMap<ReferenceArrayList<HopperBlockEntity>> byChunk = new Long2ObjectOpenHashMap<>();
++    private int sleeping;
++
++    public HopperSleep(final ServerLevel level) {
++        this.level = level;
++    }
++
++    public int sleeping() {
++        return this.sleeping;
++    }
++
++    public boolean isActive() {
++        return this.active;
++    }
++
++    /**
++     * Start of the world tick.
++     */
++    public void tick() {
++        final boolean wasActive = this.active;
++        this.active = this.configuredEnabled() && noHopperListeners();
++        if (wasActive && !this.active) {
++            this.wakeAll();
++        }
++    }
++
++    private boolean configuredEnabled() {
++        final KodamaWorldConfiguration config = this.level.kodamaConfig();
++        final KodamaWorldConfiguration.Hoppers section = config == null ? null : config.hoppers;
++        return section != null && section.enabled.isTrue() && section.idleSleep.isTrue() && this.level.spigotConfig.hopperCheck <= 1
++            && !FeatureGuard.isTripped(FEATURE_ID);
++    }
++
++    private static boolean noHopperListeners() {
++        return InventoryMoveItemEvent.getHandlerList().getRegisteredListeners().length == 0
++            && InventoryPickupItemEvent.getHandlerList().getRegisteredListeners().length == 0
++            && HopperInventorySearchEvent.getHandlerList().getRegisteredListeners().length == 0;
++    }
++
++    /**
++     * Whether the sleeping hopper may skip this attempt.
++     */
++    public boolean skip(final HopperBlockEntity hopper) {
++        if (this.active) {
++            return true;
++        }
++        this.wake(hopper);
++        return false;
++    }
++
++    /**
++     * The attempt of the hopper moved nothing; its cooldown is what the attempt left.
++     */
++    public void trySleep(final HopperBlockEntity hopper, final BlockPos pos, final BlockState state) {
++        if (!this.active || hopper.kodamaAsleep || hopper.isRemoved()) {
++            return;
++        }
++        try {
++            final Direction facing = state.getValue(HopperBlock.FACING);
++            final ArrayList<BlockPos> blocks = new ArrayList<>(6);
++            blocks.add(pos);
++            addWithChestPartner(blocks, pos.above());
++            addWithChestPartner(blocks, pos.relative(facing));
++
++            // a superset of the boxes vanilla searches for items (suck area) and container entities (above, facing),
++            // grown like Paper's entity lookup grows its search box
++            final int minX = pos.getX() - 1 - 2;
++            final int maxX = pos.getX() + 2 + 2;
++            final int minY = pos.getY() - 1 - 2;
++            final int maxY = pos.getY() + 3 + 2;
++            final int minZ = pos.getZ() - 1 - 2;
++            final int maxZ = pos.getZ() + 2 + 2;
++            final int minChunkX = minX >> 4;
++            final int maxChunkX = maxX >> 4;
++            final int minChunkZ = minZ >> 4;
++            final int maxChunkZ = maxZ >> 4;
++            final int minSection = minY >> 4;
++            final int maxSection = maxY >> 4;
++
++            final long[] chunks = new long[(maxChunkX - minChunkX + 1) * (maxChunkZ - minChunkZ + 1)];
++            final long[] sections = new long[chunks.length * (maxSection - minSection + 1)];
++            int chunkCount = 0;
++            int sectionCount = 0;
++            for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
++                for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
++                    final ChunkEntitySlices slices = this.level.getEntityLookup().getChunk(chunkX, chunkZ);
++                    if (slices == null || slices.status == null || !slices.status.isOrAfter(FullChunkStatus.FULL)
++                        || slices.kodamaHasEntitiesOfClass(ItemEntity.class, minSection, maxSection)
++                        || slices.kodamaHasEntitiesOfClass(Container.class, minSection, maxSection)) {
++                        return;
++                    }
++                    chunks[chunkCount++] = ChunkPos.asLong(chunkX, chunkZ);
++                    for (int sectionY = minSection; sectionY <= maxSection; sectionY++) {
++                        sections[sectionCount++] = SectionPos.asLong(chunkX, sectionY, chunkZ);
++                    }
++                }
++            }
++            for (final BlockPos block : blocks) {
++                if (this.level.getChunkIfLoaded(block.getX() >> 4, block.getZ() >> 4) == null) {
++                    return;
++                }
++            }
++
++            final long[] blockKeys = new long[blocks.size()];
++            for (int i = 0; i < blockKeys.length; i++) {
++                blockKeys[i] = blocks.get(i).asLong();
++            }
++            hopper.kodamaWatchBlocks = blockKeys;
++            hopper.kodamaWatchSections = sections;
++            hopper.kodamaWatchChunks = chunks;
++            hopper.kodamaSleepCooldown = hopper.cooldownTime;
++            hopper.kodamaAsleep = true;
++            register(this.byBlock, blockKeys, hopper);
++            register(this.bySection, sections, hopper);
++            register(this.byChunk, chunks, hopper);
++            this.sleeping++;
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(FEATURE_ID, throwable);
++        }
++    }
++
++    private void addWithChestPartner(final ArrayList<BlockPos> blocks, final BlockPos pos) {
++        blocks.add(pos);
++        final BlockState state = this.level.getBlockStateIfLoaded(pos);
++        if (state != null && state.getBlock() instanceof ChestBlock && state.getValue(ChestBlock.TYPE) != ChestType.SINGLE) {
++            blocks.add(pos.relative(ChestBlock.getConnectedDirection(state)));
++        }
++    }
++
++    private static void register(final Long2ObjectOpenHashMap<ReferenceArrayList<HopperBlockEntity>> map, final long[] keys, final HopperBlockEntity hopper) {
++        for (final long key : keys) {
++            ReferenceArrayList<HopperBlockEntity> list = map.get(key);
++            if (list == null) {
++                map.put(key, list = new ReferenceArrayList<>(2));
++            }
++            list.add(hopper);
++        }
++    }
++
++    private static void unregister(final Long2ObjectOpenHashMap<ReferenceArrayList<HopperBlockEntity>> map, final long @Nullable [] keys, final HopperBlockEntity hopper) {
++        if (keys == null) {
++            return;
++        }
++        for (final long key : keys) {
++            final ReferenceArrayList<HopperBlockEntity> list = map.get(key);
++            if (list != null && list.remove(hopper) && list.isEmpty()) {
++                map.remove(key);
++            }
++        }
++    }
++
++    public void wake(final HopperBlockEntity hopper) {
++        if (!hopper.kodamaAsleep) {
++            return;
++        }
++        hopper.kodamaAsleep = false;
++        unregister(this.byBlock, hopper.kodamaWatchBlocks, hopper);
++        unregister(this.bySection, hopper.kodamaWatchSections, hopper);
++        unregister(this.byChunk, hopper.kodamaWatchChunks, hopper);
++        hopper.kodamaWatchBlocks = null;
++        hopper.kodamaWatchSections = null;
++        hopper.kodamaWatchChunks = null;
++        this.sleeping--;
++    }
++
++    private void wakeList(final @Nullable ReferenceArrayList<HopperBlockEntity> list) {
++        if (list == null) {
++            return;
++        }
++        // waking removes the hopper from this list
++        final HopperBlockEntity[] hoppers = list.toArray(new HopperBlockEntity[0]);
++        for (final HopperBlockEntity hopper : hoppers) {
++            this.wake(hopper);
++        }
++    }
++
++    public void wakeAll() {
++        if (this.sleeping == 0) {
++            return;
++        }
++        final ArrayList<HopperBlockEntity> all = new ArrayList<>();
++        for (final ReferenceArrayList<HopperBlockEntity> list : this.byChunk.values()) {
++            all.addAll(list);
++        }
++        for (final HopperBlockEntity hopper : all) {
++            this.wake(hopper);
++        }
++    }
++
++    /**
++     * A plugin got a Bukkit inventory of the container.
++     */
++    public static void touched(final Container container) {
++        if (container instanceof net.minecraft.world.level.block.entity.BlockEntity blockEntity
++            && blockEntity.getLevel() instanceof ServerLevel serverLevel && serverLevel.getServer().isSameThread()) {
++            serverLevel.kodamaHoppers.blockChanged(blockEntity.getBlockPos());
++        }
++    }
++
++    public void blockChanged(final BlockPos pos) {
++        if (!this.byBlock.isEmpty()) {
++            this.wakeList(this.byBlock.get(pos.asLong()));
++        }
++    }
++
++    public void entityEntered(final Entity entity, final int chunkX, final int sectionY, final int chunkZ) {
++        if (!this.bySection.isEmpty() && (entity instanceof ItemEntity || entity instanceof Container)) {
++            this.wakeList(this.bySection.get(SectionPos.asLong(chunkX, sectionY, chunkZ)));
++        }
++    }
++
++    public void chunkStatusChanged(final int chunkX, final int chunkZ) {
++        if (!this.byChunk.isEmpty()) {
++            this.wakeList(this.byChunk.get(ChunkPos.asLong(chunkX, chunkZ)));
++        }
++    }
++}
+diff --git a/src/main/java/dev/kodama/hopper/HopperStatus.java b/src/main/java/dev/kodama/hopper/HopperStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a185f32ea5a45a70b2ae7ece3def173cfb3b286
+--- /dev/null
++++ b/src/main/java/dev/kodama/hopper/HopperStatus.java
+@@ -0,0 +1,40 @@
++package dev.kodama.hopper;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.TextComponent;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++/**
++ * The {@code Hoppers} line of {@code /kodama status}.
++ */
++public final class HopperStatus {
++
++    private HopperStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Hoppers";
++            }
++
++            @Override
++            public Component describe() {
++                TextComponent result = text("");
++                for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                    result = result.append(text("\n  " + level.getWorld().getName() + ": ", WHITE));
++                    result = result.append(text(level.kodamaHoppers.isActive() ? level.kodamaHoppers.sleeping() + " sleeping" : "idle sleep off", GRAY));
++                }
++                return result;
++            }
++        });
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java b/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
+index c78cbec447032de9fe69748591bef6be300160ed..5e7083cb38095e8c33b176a906ec2109b1ff1529 100644
+--- a/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
++++ b/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
+@@ -187,6 +187,7 @@ public final class ChunkEntitySlices {
+ 
+     public void updateStatus(final FullChunkStatus status, final EntityLookup lookup) {
+         this.status = status;
++        this.world.kodamaHoppers.chunkStatusChanged(this.chunkX, this.chunkZ); // Kodama - hopper-sleep
+ 
+         final Entity[] entities = this.entities.getRawData();
+ 
+@@ -223,6 +224,7 @@ public final class ChunkEntitySlices {
+             }
+         }
+ 
++        this.world.kodamaHoppers.entityEntered(entity, this.chunkX, chunkSection, this.chunkZ); // Kodama - hopper-sleep
+         return true;
+     }
+ 
+@@ -268,6 +270,28 @@ public final class ChunkEntitySlices {
+         this.allEntities.getEntities(type, box, (List)into, (Predicate)predicate);
+     }
+ 
++    // Kodama start - hopper-sleep
++    /**
++     * Whether an entity of the class is in one of the sections, by the same per class index the class lookups use.
++     */
++    @SuppressWarnings({"rawtypes", "unchecked"})
++    public boolean kodamaHasEntitiesOfClass(final Class clazz, final int minSectionY, final int maxSectionY) {
++        EntityCollectionBySection collection = this.entitiesByClass.get(clazz);
++        if (collection == null) {
++            this.entitiesByClass.putIfAbsent(clazz, collection = this.initClass(clazz));
++        }
++        if (collection.count == 0) {
++            return false;
++        }
++        for (int sectionY = Math.max(minSectionY, this.minSection), max = Math.min(maxSectionY, this.maxSection); sectionY <= max; ++sectionY) {
++            if (collection.entitiesBySection[sectionY - this.minSection] != null) {
++                return true;
++            }
++        }
++        return false;
++    }
++    // Kodama end - hopper-sleep
++
+     protected EntityCollectionBySection initClass(final Class<? extends Entity> clazz) {
+         final EntityCollectionBySection ret = new EntityCollectionBySection(this);
+ 
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 45b302646ee2a736e11716d24909caefc76f1ee8..85ae0a424a885fa207f8bc12496e6ae6dadb88d0 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -523,6 +523,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     public final io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader playerChunkLoader = new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader(this);
+     public final dev.kodama.entity.lod.MobLodManager kodamaMobLod = new dev.kodama.entity.lod.MobLodManager(this); // Kodama - mob-lod
+     public final dev.kodama.redstone.RedstoneMonitor kodamaRedstone = new dev.kodama.redstone.RedstoneMonitor(this); // Kodama - redstone
++    public final dev.kodama.hopper.HopperSleep kodamaHoppers = new dev.kodama.hopper.HopperSleep(this); // Kodama - hopper-sleep
+     private final java.util.concurrent.atomic.AtomicReference<io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances> viewDistances = new java.util.concurrent.atomic.AtomicReference<>(new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances(-1, -1, -1));
+ 
+     public io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances getViewDistances() {
+@@ -815,6 +816,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+         this.handlingTick = true;
+         this.kodamaRedstone.tick(); // Kodama - redstone
++        this.kodamaHoppers.tick(); // Kodama - hopper-sleep
+         TickRateManager tickratemanager = this.tickRateManager();
+         boolean flag = tickratemanager.runsNormally();
+ 
+diff --git a/src/main/java/net/minecraft/world/level/block/entity/BlockEntity.java b/src/main/java/net/minecraft/world/level/block/entity/BlockEntity.java
+index c0563260277f9f4bd9ff08993b2efb4bca9a0c60..25f691fa383023503fae3f18c74994e965ae514a 100644
+--- a/src/main/java/net/minecraft/world/level/block/entity/BlockEntity.java
++++ b/src/main/java/net/minecraft/world/level/block/entity/BlockEntity.java
+@@ -224,6 +224,7 @@ public abstract class BlockEntity {
+     }
+ 
+     protected static void setChanged(Level world, BlockPos pos, BlockState state) {
++        if (world instanceof net.minecraft.server.level.ServerLevel serverLevel) serverLevel.kodamaHoppers.blockChanged(pos); // Kodama - hopper-sleep
+         world.blockEntityChanged(pos);
+         if (!state.isAir()) {
+             world.updateNeighbourForOutputSignal(pos, state.getBlock());
+diff --git a/src/main/java/net/minecraft/world/level/block/entity/HopperBlockEntity.java b/src/main/java/net/minecraft/world/level/block/entity/HopperBlockEntity.java
+index ab5ce14f024305fcf3df4254212363145457eddb..336d2b56edbddf05ef145c4657450a8b7d1d7d47 100644
+--- a/src/main/java/net/minecraft/world/level/block/entity/HopperBlockEntity.java
++++ b/src/main/java/net/minecraft/world/level/block/entity/HopperBlockEntity.java
+@@ -49,6 +49,13 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+     private static final int[][] CACHED_SLOTS = new int[54][];
+     private NonNullList<ItemStack> items;
+     public int cooldownTime;
++    // Kodama start - hopper-sleep
++    public boolean kodamaAsleep;
++    public int kodamaSleepCooldown;
++    public long[] kodamaWatchBlocks;
++    public long[] kodamaWatchSections;
++    public long[] kodamaWatchChunks;
++    // Kodama end - hopper-sleep
+     private long tickedGameTime;
+     private Direction facing;
+ 
+@@ -128,6 +135,16 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+         stack.limitSize(this.getMaxStackSize(stack));
+     }
+ 
++    // Kodama start - hopper-sleep
++    @Override
++    public void setRemoved() {
++        super.setRemoved();
++        if (this.level instanceof net.minecraft.server.level.ServerLevel serverLevel) {
++            serverLevel.kodamaHoppers.wake(this);
++        }
++    }
++    // Kodama end - hopper-sleep
++
+     @Override
+     public void setBlockState(BlockState state) {
+         super.setBlockState(state);
+@@ -143,6 +160,12 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+         --blockEntity.cooldownTime;
+         blockEntity.tickedGameTime = world.getGameTime();
+         if (!blockEntity.isOnCooldown()) {
++            // Kodama start - hopper-sleep - an unchanged world fails the same way, leaving the same cooldown
++            if (blockEntity.kodamaAsleep && world instanceof net.minecraft.server.level.ServerLevel serverLevel && serverLevel.kodamaHoppers.skip(blockEntity)) {
++                blockEntity.setCooldown(blockEntity.kodamaSleepCooldown);
++                return;
++            }
++            // Kodama end - hopper-sleep
+             blockEntity.setCooldown(0);
+             // Spigot start
+             boolean result = HopperBlockEntity.tryMoveItems(world, pos, state, blockEntity, () -> {
+@@ -152,6 +175,7 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+                 blockEntity.setCooldown(blockEntity.level.spigotConfig.hopperCheck);
+             }
+             // Spigot end
++            if (!result && world instanceof net.minecraft.server.level.ServerLevel serverLevel) serverLevel.kodamaHoppers.trySleep(blockEntity, pos, state); // Kodama - hopper-sleep
+         }
+ 
+     }
+diff --git a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+index ec025e95db3f45a7971dd64c917c61414852fbb9..79466b3a3046952520c5b3cfd2be845f0c8cb91e 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -453,6 +453,7 @@ public class LevelChunk extends ChunkAccess {
+             if (iblockdata1 == iblockdata) {
+                 return null;
+             } else {
++                this.level.kodamaHoppers.blockChanged(blockposition); // Kodama - hopper-sleep
+                 Block block = iblockdata.getBlock();
+ 
+                 ((Heightmap) this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING)).update(j, i, l, iblockdata);
+diff --git a/src/main/java/org/bukkit/craftbukkit/inventory/CraftInventory.java b/src/main/java/org/bukkit/craftbukkit/inventory/CraftInventory.java
+index af1ae3dacb628da23f7d2988c6e76d3fb2d64103..b310a7b6028fd304ad40d3834028eede0fff454b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/inventory/CraftInventory.java
++++ b/src/main/java/org/bukkit/craftbukkit/inventory/CraftInventory.java
+@@ -36,6 +36,7 @@ public class CraftInventory implements Inventory {
+ 
+     public CraftInventory(Container inventory) {
+         this.inventory = inventory;
++        dev.kodama.hopper.HopperSleep.touched(inventory); // Kodama - hopper-sleep - plugins can change items through mirrors without telling the container
+     }
+ 
+     public Container getInventory() {
