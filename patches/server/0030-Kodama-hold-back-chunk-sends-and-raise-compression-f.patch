@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 06:57:09 +0900
+Subject: [PATCH] Kodama: hold back chunk sends and raise compression for
+ congested connections
+
+
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+index 1ee8472448aa9b982ea44c4c5bfd917ed0b84c69..f0ab15a4ce754dc6db83a568d5c3c03fe24c3dbb 100644
+--- a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -50,6 +50,7 @@ public final class StatusCommand extends PermissionedKodamaSubcommand {
+         dev.kodama.chunk.ChunkLoadingStatus.register();
+         dev.kodama.chunk.precache.PrecacheStatus.register();
+         dev.kodama.entity.lod.MobLodStatus.register();
++        dev.kodama.network.NetworkStatus.register();
+     }
+ 
+     public StatusCommand() {
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index 6b7af960f47cc09ab8ddeb7bd54d26359094720d..fe90c0b571544f6fae9212b3aa8c54b408347c01 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -178,8 +178,42 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+     public Network network;
+ 
+     public class Network extends ConfigurationPart {
+-        @Comment("Enables the network optimizations.")
++        @Comment("Enables the network optimizations. Master switch of every option below.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++        @Comment("Holds back chunk packets for a player whose connection cannot keep up, so entity and block updates are not queued behind\n"
++            + "megabytes of chunk data. The chunks are sent as soon as the connection has drained.")
++        public ChunkBacklog chunkBacklog;
++
++        public class ChunkBacklog extends ConfigurationPart {
++            @Comment("Enables holding back chunk packets.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("Kilobytes of packets waiting for the connection of a player above which no new chunks are sent to that player.")
++            @Constraints.Min(16)
++            public int maxPendingKb = 1024;
++        }
++
++        @Comment("Compresses packets harder for a player whose connection cannot keep up, and goes back to the configured level\n"
++            + "(compression-level in the Paper global config) once it has drained. Costs CPU of the network threads, not of the main thread.")
++        public AdaptiveCompression adaptiveCompression;
++
++        public class AdaptiveCompression extends ConfigurationPart {
++            @Comment("Enables the adaptive compression level.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("Kilobytes of packets waiting for the connection of a player above which the connection counts as congested.")
++            @Constraints.Min(1)
++            public int congestedPendingKb = 256;
++
++            @Comment("Compression level (1-9, higher values are used as 9) used while the connection is congested.")
++            @Constraints.Min(1)
++            public int congestedLevel = 9;
++
++            @Comment("Seconds without congestion before the configured level is used again.")
++            @Constraints.Min(1)
++            public int relaxSeconds = 10;
++        }
+     }
+ 
+     @Comment("Moves expensive work to background threads.")
+diff --git a/src/main/java/dev/kodama/network/ConnectionBacklog.java b/src/main/java/dev/kodama/network/ConnectionBacklog.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5e39dcd07f6675e0f56652d2d9cbee654efac28
+--- /dev/null
++++ b/src/main/java/dev/kodama/network/ConnectionBacklog.java
+@@ -0,0 +1,94 @@
++package dev.kodama.network;
++
++import dev.kodama.feature.FeatureGuard;
++import io.netty.channel.Channel;
++import io.netty.channel.ChannelOutboundBuffer;
++import java.util.concurrent.atomic.LongAdder;
++import net.minecraft.network.CompressionEncoder;
++import net.minecraft.network.Connection;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.server.network.ServerGamePacketListenerImpl;
++
++/**
++ * Reacts to connections that cannot keep up: chunk packets are held back and packets are compressed harder.
++ * <p>
++ * The backlog is the size of the encoded packets in the Netty outbound buffer, which only grows when the socket does
++ * not drain (packets that are not encoded yet count as zero). Both reads are safe off the event loop.
++ */
++public final class ConnectionBacklog {
++
++    private static final int COMPRESSION_CHECK_INTERVAL = 20;
++
++    private static final LongAdder HELD_SENDS = new LongAdder();
++
++    private ConnectionBacklog() {
++    }
++
++    public static long pendingBytes(final Connection connection) {
++        final Channel channel = connection.channel;
++        if (channel == null) {
++            return 0L;
++        }
++        final ChannelOutboundBuffer buffer = channel.unsafe().outboundBuffer();
++        return buffer == null ? 0L : buffer.totalPendingWriteBytes();
++    }
++
++    /**
++     * Whether no new chunk should be sent to the player this tick. Main thread.
++     */
++    public static boolean holdChunkSends(final ServerPlayer player) {
++        if (!NetworkSettings.chunkBacklogEnabled() || player.connection == null) {
++            return false;
++        }
++        try {
++            if (pendingBytes(player.connection.connection) < NetworkSettings.chunkBacklogBytes()) {
++                return false;
++            }
++            HELD_SENDS.increment();
++            return true;
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(NetworkSettings.CHUNK_BACKLOG_ID, throwable);
++            return false;
++        }
++    }
++
++    /**
++     * Picks the compression level of the player's connection once a second. Main thread.
++     */
++    public static void tickCompression(final ServerGamePacketListenerImpl listener, final int tickCount) {
++        if (tickCount % COMPRESSION_CHECK_INTERVAL != 0) {
++            return;
++        }
++        try {
++            final Connection connection = listener.connection;
++            if (connection.channel == null || !(connection.channel.pipeline().get("compress") instanceof CompressionEncoder encoder)) {
++                return;
++            }
++            if (!NetworkSettings.adaptiveCompressionEnabled()) {
++                if (encoder.kodamaLevel() != CompressionEncoder.KODAMA_BASE_LEVEL) {
++                    encoder.kodamaSetLevel(CompressionEncoder.KODAMA_BASE_LEVEL);
++                }
++                return;
++            }
++            final long now = MinecraftServer.currentTickLong;
++            if (pendingBytes(connection) >= NetworkSettings.congestedBytes()) {
++                connection.kodamaLastCongestedTick = now;
++                encoder.kodamaSetLevel(NetworkSettings.congestedLevel());
++            } else if (encoder.kodamaLevel() != CompressionEncoder.KODAMA_BASE_LEVEL
++                && now - connection.kodamaLastCongestedTick >= NetworkSettings.relaxTicks()) {
++                encoder.kodamaSetLevel(CompressionEncoder.KODAMA_BASE_LEVEL);
++            }
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(NetworkSettings.ADAPTIVE_COMPRESSION_ID, throwable);
++        }
++    }
++
++    static long heldSends() {
++        return HELD_SENDS.sum();
++    }
++}
+diff --git a/src/main/java/dev/kodama/network/NetworkSettings.java b/src/main/java/dev/kodama/network/NetworkSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6b9ee51e0c4f85b747ede793c1e2d964c872507
+--- /dev/null
++++ b/src/main/java/dev/kodama/network/NetworkSettings.java
+@@ -0,0 +1,60 @@
++package dev.kodama.network;
++
++import dev.kodama.config.KodamaGlobalConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Read-only view of {@code network} with the master switch and the {@link FeatureGuard} state already applied. Every
++ * call reads the live configuration.
++ */
++final class NetworkSettings {
++
++    static final String CHUNK_BACKLOG_ID = "network-chunk-backlog";
++    static final String ADAPTIVE_COMPRESSION_ID = "network-adaptive-compression";
++
++    private NetworkSettings() {
++    }
++
++    private static KodamaGlobalConfiguration.@Nullable Network section() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null ? null : config.network;
++    }
++
++    static boolean masterEnabled() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return section != null && section.enabled.isTrue();
++    }
++
++    static boolean chunkBacklogEnabled() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return masterEnabled() && section.chunkBacklog != null && section.chunkBacklog.enabled.isTrue()
++            && !FeatureGuard.isTripped(CHUNK_BACKLOG_ID);
++    }
++
++    static long chunkBacklogBytes() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return (section == null || section.chunkBacklog == null ? 1024L : Math.max(16L, section.chunkBacklog.maxPendingKb)) * 1024L;
++    }
++
++    static boolean adaptiveCompressionEnabled() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return masterEnabled() && section.adaptiveCompression != null && section.adaptiveCompression.enabled.isTrue()
++            && !FeatureGuard.isTripped(ADAPTIVE_COMPRESSION_ID);
++    }
++
++    static long congestedBytes() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return (section == null || section.adaptiveCompression == null ? 256L : Math.max(1L, section.adaptiveCompression.congestedPendingKb)) * 1024L;
++    }
++
++    static int congestedLevel() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return section == null || section.adaptiveCompression == null ? 9 : Math.max(1, Math.min(9, section.adaptiveCompression.congestedLevel));
++    }
++
++    static int relaxTicks() {
++        final KodamaGlobalConfiguration.Network section = section();
++        return (section == null || section.adaptiveCompression == null ? 10 : Math.max(1, section.adaptiveCompression.relaxSeconds)) * 20;
++    }
++}
+diff --git a/src/main/java/dev/kodama/network/NetworkStatus.java b/src/main/java/dev/kodama/network/NetworkStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..14bcfce45654de26f148b2b7c82cf9e11df723f9
+--- /dev/null
++++ b/src/main/java/dev/kodama/network/NetworkStatus.java
+@@ -0,0 +1,56 @@
++package dev.kodama.network;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import net.kyori.adventure.text.Component;
++import net.minecraft.network.CompressionEncoder;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerPlayer;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++
++/**
++ * The {@code /kodama status} line of the network optimizations.
++ */
++public final class NetworkStatus {
++
++    private NetworkStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Network";
++            }
++
++            @Override
++            public Component describe() {
++                if (!NetworkSettings.masterEnabled()) {
++                    return text("off", GRAY);
++                }
++                int congested = 0;
++                int raised = 0;
++                long largest = 0L;
++                for (final ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
++                    if (player.connection == null || player.connection.connection.channel == null) {
++                        continue;
++                    }
++                    final long pending = ConnectionBacklog.pendingBytes(player.connection.connection);
++                    largest = Math.max(largest, pending);
++                    if (pending >= NetworkSettings.chunkBacklogBytes()) {
++                        congested++;
++                    }
++                    if (player.connection.connection.channel.pipeline().get("compress") instanceof CompressionEncoder encoder
++                        && encoder.kodamaLevel() != CompressionEncoder.KODAMA_BASE_LEVEL) {
++                        raised++;
++                    }
++                }
++                return text("chunk backlog " + (NetworkSettings.chunkBacklogEnabled() ? "on" : "off")
++                    + " (" + congested + " players held back now, " + ConnectionBacklog.heldSends() + " ticks held in total), adaptive compression "
++                    + (NetworkSettings.adaptiveCompressionEnabled() ? "on" : "off") + " (" + raised + " players at a higher level), largest backlog " + (largest / 1024L) + " KB", GRAY);
++            }
++        });
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+index 09654e347faaf38e24d35459bd1e898fc0232ccf..0f28c2b4b308ec2437c2630d7754d196d230bc2a 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
++++ b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+@@ -818,7 +818,12 @@ public class RegionizedPlayerChunkLoader {
+ 
+             // try to pull sending chunks
+             final long maxSends = Math.max(0L, Math.min(MAX_RATE, Integer.MAX_VALUE)); // no logic to track concurrent sends
+-            final int maxSendsThisTick = Math.min((int)this.chunkSendLimiter.takeAllocation(time, sendRate, maxSends), this.sendQueue.size());
++            int maxSendsThisTick = Math.min((int)this.chunkSendLimiter.takeAllocation(time, sendRate, maxSends), this.sendQueue.size()); // Kodama - network-chunk-backlog - not final
++            // Kodama start - network-chunk-backlog - the allocation is still taken so that the chunks do not burst out once the connection drained
++            if (maxSendsThisTick > 0 && dev.kodama.network.ConnectionBacklog.holdChunkSends(this.player)) {
++                maxSendsThisTick = 0;
++            }
++            // Kodama end - network-chunk-backlog
+             // we do not return sends that we took from the allocation back because we want to limit the max send rate, not target it
+             for (int i = 0; i < maxSendsThisTick; ++i) {
+                 final long pendingSend = this.sendQueue.firstLong();
+diff --git a/src/main/java/net/minecraft/network/CompressionEncoder.java b/src/main/java/net/minecraft/network/CompressionEncoder.java
+index ec30c291188ac3bba7f1c3bc397576d1edb0a57f..74c519eb23f564d0302fc0b1d8bc6313d8c646c6 100644
+--- a/src/main/java/net/minecraft/network/CompressionEncoder.java
++++ b/src/main/java/net/minecraft/network/CompressionEncoder.java
+@@ -12,6 +12,12 @@ public class CompressionEncoder extends MessageToByteEncoder<ByteBuf> {
+     @javax.annotation.Nullable // Paper - Use Velocity cipher
+     private final com.velocitypowered.natives.compression.VelocityCompressor compressor; // Paper - Use Velocity cipher
+     private int threshold;
++    // Kodama start - network-adaptive-compression
++    public static final int KODAMA_BASE_LEVEL = Integer.MIN_VALUE;
++    private volatile int kodamaTargetLevel = KODAMA_BASE_LEVEL;
++    @javax.annotation.Nullable private com.velocitypowered.natives.compression.VelocityCompressor kodamaLevelCompressor; // only touched on the event loop
++    private int kodamaLevelCompressorLevel;
++    // Kodama end - network-adaptive-compression
+ 
+     // Paper start - Use Velocity cipher
+     public CompressionEncoder(int compressionThreshold) {
+@@ -43,6 +49,7 @@ public class CompressionEncoder extends MessageToByteEncoder<ByteBuf> {
+                 byte[] bs = new byte[i];
+                 byteBuf.readBytes(bs);
+                 VarInt.write(byteBuf2, bs.length);
++                this.deflater.setLevel(this.kodamaTargetLevel == KODAMA_BASE_LEVEL ? Deflater.DEFAULT_COMPRESSION : this.kodamaTargetLevel); // Kodama - network-adaptive-compression
+                 this.deflater.setInput(bs, 0, i);
+                 this.deflater.finish();
+ 
+@@ -57,9 +64,10 @@ public class CompressionEncoder extends MessageToByteEncoder<ByteBuf> {
+                 }
+ 
+                 VarInt.write(byteBuf2, i);
+-                final ByteBuf compatibleIn = com.velocitypowered.natives.util.MoreByteBufUtils.ensureCompatible(channelHandlerContext.alloc(), this.compressor, byteBuf);
++                final com.velocitypowered.natives.compression.VelocityCompressor compressor = this.kodamaCompressor(); // Kodama - network-adaptive-compression
++                final ByteBuf compatibleIn = com.velocitypowered.natives.util.MoreByteBufUtils.ensureCompatible(channelHandlerContext.alloc(), compressor, byteBuf);
+                 try {
+-                    this.compressor.deflate(compatibleIn, byteBuf2);
++                    compressor.deflate(compatibleIn, byteBuf2);
+                 } finally {
+                     compatibleIn.release();
+                 }
+@@ -85,8 +93,43 @@ public class CompressionEncoder extends MessageToByteEncoder<ByteBuf> {
+         return super.allocateBuffer(ctx, msg, preferDirect);
+     }
+ 
++    // Kodama start - network-adaptive-compression
++    /**
++     * Compression level for the next packets, or {@link #KODAMA_BASE_LEVEL} for the configured one. Any thread.
++     */
++    public void kodamaSetLevel(final int level) {
++        this.kodamaTargetLevel = level;
++    }
++
++    public int kodamaLevel() {
++        return this.kodamaTargetLevel;
++    }
++
++    // the configured compressor is shared with the decoder, so another level gets a compressor of its own
++    private com.velocitypowered.natives.compression.VelocityCompressor kodamaCompressor() {
++        final int level = this.kodamaTargetLevel;
++        if (level == KODAMA_BASE_LEVEL) {
++            return this.compressor;
++        }
++        if (this.kodamaLevelCompressor == null || this.kodamaLevelCompressorLevel != level) {
++            if (this.kodamaLevelCompressor != null) {
++                this.kodamaLevelCompressor.close();
++            }
++            this.kodamaLevelCompressor = com.velocitypowered.natives.util.Natives.compress.get().create(level);
++            this.kodamaLevelCompressorLevel = level;
++        }
++        return this.kodamaLevelCompressor;
++    }
++    // Kodama end - network-adaptive-compression
++
+     @Override
+     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
++        // Kodama start - network-adaptive-compression
++        if (this.kodamaLevelCompressor != null) {
++            this.kodamaLevelCompressor.close();
++            this.kodamaLevelCompressor = null;
++        }
++        // Kodama end - network-adaptive-compression
+         if (this.compressor != null) {
+             this.compressor.close();
+             // Paper end - Use Velocity cipher
+diff --git a/src/main/java/net/minecraft/network/Connection.java b/src/main/java/net/minecraft/network/Connection.java
+index f40420a6841f03983b0837e177ea2ae7c3a37ca1..7e2262bf60c2c221c4b6742109fafcd11ef188f6 100644
+--- a/src/main/java/net/minecraft/network/Connection.java
++++ b/src/main/java/net/minecraft/network/Connection.java
+@@ -95,6 +95,7 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     private volatile boolean sendLoginDisconnect = true;
+     private final Queue<WrappedConsumer> pendingActions = Queues.newConcurrentLinkedQueue(); // Paper
+     public Channel channel;
++    public long kodamaLastCongestedTick = Long.MIN_VALUE / 2; // Kodama - network-adaptive-compression
+     public SocketAddress address;
+     // Spigot Start
+     public java.util.UUID spoofedUUID;
+diff --git a/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index dd0610104822bee532542c87ecc9cd16ccf3c216..9d7836f86c471ea0a1c335c3a3a2b6d6ce8f7f46 100644
+--- a/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -346,6 +346,7 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+         this.player.doTick();
+         this.player.absMoveTo(this.firstGoodX, this.firstGoodY, this.firstGoodZ, this.player.getYRot(), this.player.getXRot());
+         ++this.tickCount;
++        dev.kodama.network.ConnectionBacklog.tickCompression(this, this.tickCount); // Kodama - network-adaptive-compression
+         this.knownMovePacketCount = this.receivedMovePacketCount;
+         if (this.clientIsFloating && !this.player.isSleeping() && !this.player.isPassenger() && !this.player.isDeadOrDying()) {
+             if (++this.aboveGroundTickCount > this.getMaximumFlyingTicks(this.player)) {

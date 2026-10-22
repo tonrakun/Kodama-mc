@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 06:57:09 +0900
+Subject: [PATCH] Kodama: return early from water sources enclosed by water
+
+
+diff --git a/src/main/java/net/minecraft/world/level/material/FlowingFluid.java b/src/main/java/net/minecraft/world/level/material/FlowingFluid.java
+index ab405f08a2aff46661a607382f1255f6bcb21d1e..680fc34736169622cccf84d00329e04c10c79077 100644
+--- a/src/main/java/net/minecraft/world/level/material/FlowingFluid.java
++++ b/src/main/java/net/minecraft/world/level/material/FlowingFluid.java
+@@ -132,7 +132,25 @@ public abstract class FlowingFluid extends Fluid {
+         return fluid.getType().isSame(this) ? false : (direction == Direction.UP ? true : (iblockdata.getBlock() instanceof IceBlock ? false : iblockdata.isFaceSturdy(world, pos, direction)));
+     }
+ 
++    // Kodama start - a water source with water below and water sources on all four sides cannot spread anywhere:
++    // the liquid below stays water (so it is not replaceable) and every side is a source of the same fluid
++    private boolean kodamaIsEnclosedWaterSource(Level world, BlockPos pos, FluidState state) {
++        if (!state.isSource() || state.getType() != Fluids.WATER || !world.getBlockState(pos).is(net.minecraft.world.level.block.Blocks.WATER)
++            || !world.getBlockState(pos.below()).is(net.minecraft.world.level.block.Blocks.WATER)) {
++            return false;
++        }
++        for (Direction direction : Direction.Plane.HORIZONTAL) {
++            BlockState side = world.getBlockStateIfLoaded(pos.relative(direction));
++            if (side == null || !side.is(net.minecraft.world.level.block.Blocks.WATER) || !side.getFluidState().isSource()) {
++                return false;
++            }
++        }
++        return true;
++    }
++    // Kodama end
++
+     protected void spread(Level world, BlockPos fluidPos, FluidState state) {
++        if (this.kodamaIsEnclosedWaterSource(world, fluidPos, state)) return; // Kodama
+         if (!state.isEmpty()) {
+             BlockState iblockdata = world.getBlockState(fluidPos);
+             BlockPos blockposition1 = fluidPos.below();

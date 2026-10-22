@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 06:46:02 +0900
+Subject: [PATCH] Kodama: pack single value palettes directly and remap
+ palettes through an array
+
+
+diff --git a/src/main/java/net/minecraft/world/level/chunk/PalettedContainer.java b/src/main/java/net/minecraft/world/level/chunk/PalettedContainer.java
+index 81368bf186365878db2e1ed305bb7bf36c26f61f..bb0adce6587cd6859e26179a5b3c2962c8a7a54d 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/PalettedContainer.java
++++ b/src/main/java/net/minecraft/world/level/chunk/PalettedContainer.java
+@@ -306,10 +306,30 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+ 
+         PalettedContainerRO.PackedData var12;
+         try {
++            // Kodama start - single value sections pack to their only value, which is most of the sky and the deep stone
++            if (this.data.storage.getBits() == 0 && paletteProvider.calculateBitsForSerialization(idList, 1) == 0) {
++                return new PalettedContainerRO.PackedData<>(List.of(this.data.palette.valueFor(0)), Optional.empty());
++            }
++            // Kodama end
+             HashMapPalette<T> hashMapPalette = new HashMapPalette<>(idList, this.data.storage.getBits(), this.dummyPaletteResize);
+             int i = paletteProvider.size();
+             int[] is = new int[i];
+             this.data.storage.unpack(is);
++            // Kodama start - remap through an array instead of a palette and identity map lookup per run
++            if (!(this.data.palette instanceof GlobalPalette)) {
++                int[] remap = new int[this.data.palette.getSize()];
++                Arrays.fill(remap, -1);
++                for (int k = 0; k < is.length; k++) {
++                    int old = is[k];
++                    int mapped = remap[old];
++                    if (mapped < 0) {
++                        mapped = hashMapPalette.idFor(this.data.palette.valueFor(old));
++                        remap[old] = mapped;
++                    }
++                    is[k] = mapped;
++                }
++            } else
++            // Kodama end
+             swapPalette(is, id -> hashMapPalette.idFor(this.data.palette.valueFor(id)));
+             int j = paletteProvider.calculateBitsForSerialization(idList, hashMapPalette.getSize());
+             Optional<LongStream> optional;
