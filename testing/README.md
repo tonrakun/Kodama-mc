@@ -1,6 +1,6 @@
 # Kodama testing tools
 
-- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, the plugin smoke test and the redstone monitoring test.
+- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, the plugin smoke test, the redstone monitoring test and the config GUI test.
 - `vanilla-diff/compare_worlds.py` - chunk-by-chunk Anvil comparer (Python 3, stdlib only).
 - `harness-plugin/` - server plugin that pre-generates worlds, records metrics and runs the plugin smoke test and the redstone test (driven by `-Dkodama.harness.*`).
 
@@ -150,6 +150,27 @@ Exit code is 1 if any check fails.
 
 Output goes to `testing/results/redstone-<timestamp>/`: `console-redstone.log` and `console-redstone-verify.log`,
 `report.json` and `report.md` (also printed to stdout).
+
+## Config GUI
+
+```sh
+cd testing/bench
+npm run gui
+```
+
+Kodama only, without the harness plugin. One server run with two mineflayer bots: `guiop` (op) and `guiuser`. The op bot runs
+`/kodama gui`, opens categories, and clicks booleans, numbers and the preset enum; each result is read back from
+`config/kodama-global.yml`, `config/kodama-world-defaults.yml` or `world/kodama-world.yml` and reverted with `/kodama config undo`. The checks are
+
+- a non-op player cannot open the GUI,
+- boolean, number (left, shift-right, drop) and enum clicks change the right file, and `undo` reverts them in reverse order,
+- an out of range value (`feature-safety.max-exceptions` below 1) is rejected in chat, not written, and the GUI stays open,
+- the world selector and `/kodama gui <world>` choose the world file, and world options otherwise go to the world defaults,
+- the redstone button switches the chunk of the bot to Alternate Current,
+- no item can be taken out of the GUI (normal, shift and drop clicks).
+
+Exit code is 1 if any check fails. Options: `--port` (25800), `--heap` (2G), `--java`, `--jvm-args`, `--view-distance`,
+`--simulation-distance`, `--keep-work`. Output goes to `testing/results/gui-<timestamp>/`: `console.log`, `report.json`, `report.md`.
 
 ## compare_worlds.py
 

@@ -11,7 +11,8 @@
     "bench": "node src/cli.js bench",
     "vanilla": "node src/cli.js vanilla",
     "plugins": "node src/cli.js plugins",
-    "redstone": "node src/cli.js redstone"
+    "redstone": "node src/cli.js redstone",
+    "gui": "node src/cli.js gui"
   },
   "dependencies": {
     "mineflayer": "^4.39.0"

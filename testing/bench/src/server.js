@@ -64,7 +64,7 @@ export function prepareServerDir(dir, o) {
     mkdirSync(join(dir, 'config'), { recursive: true });
     writeFileSync(join(dir, 'config', 'paper-global.yml'), 'chunk-system:\n  worker-threads: 1\n');
   }
-  cpSync(o.harnessJar, join(dir, 'plugins', 'kodama-harness.jar'));
+  if (o.harnessJar) cpSync(o.harnessJar, join(dir, 'plugins', 'kodama-harness.jar'));
   for (const name of PAPERCLIP_DIRS) {
     const cached = join(CACHE, 'paperclip', o.flavor, name);
     if (existsSync(cached)) cpSync(cached, join(dir, name), { recursive: true });
