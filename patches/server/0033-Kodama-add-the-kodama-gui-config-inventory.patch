@@ -1,0 +1,862 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 07:43:18 +0900
+Subject: [PATCH] Kodama: add the /kodama gui config inventory
+
+
+diff --git a/src/main/java/dev/kodama/command/KodamaCommand.java b/src/main/java/dev/kodama/command/KodamaCommand.java
+index 320ed4ac7227d3a99871b973deb42bc5157b4dbd..ce1b75059659b2633b41d777b7a13a800a41cbbb 100644
+--- a/src/main/java/dev/kodama/command/KodamaCommand.java
++++ b/src/main/java/dev/kodama/command/KodamaCommand.java
+@@ -1,6 +1,7 @@
+ package dev.kodama.command;
+ 
+ import dev.kodama.command.subcommands.ConfigCommand;
++import dev.kodama.command.subcommands.GuiCommand;
+ import dev.kodama.command.subcommands.LodCommand;
+ import dev.kodama.command.subcommands.PrecacheCommand;
+ import dev.kodama.command.subcommands.RedstoneCommand;
+@@ -46,6 +47,7 @@ public final class KodamaCommand extends Command {
+         SUBCOMMANDS.put(PrecacheCommand.LITERAL_ARGUMENT, new PrecacheCommand());
+         SUBCOMMANDS.put(LodCommand.LITERAL_ARGUMENT, new LodCommand());
+         SUBCOMMANDS.put(RedstoneCommand.LITERAL_ARGUMENT, new RedstoneCommand());
++        SUBCOMMANDS.put(GuiCommand.LITERAL_ARGUMENT, new GuiCommand());
+     }
+ 
+     public KodamaCommand() {
+diff --git a/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java b/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java
+index 8bc6e11df7317152b7e2efb29fa537bf431c2802..15f6e58bf12c3f4b521af1cf64a2948d291c97b6 100644
+--- a/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/ConfigCommand.java
+@@ -69,15 +69,15 @@ public final class ConfigCommand implements KodamaSubcommand {
+         return permissions;
+     }
+ 
+-    private static boolean canView(final CommandSender sender, final ConfigSchema.Option option) {
++    public static boolean canView(final CommandSender sender, final ConfigSchema.Option option) {
+         return sender.hasPermission(VIEW_PERM) || sender.hasPermission(VIEW_PERM + "." + option.path());
+     }
+ 
+-    private static boolean canEdit(final CommandSender sender, final ConfigSchema.Option option) {
++    public static boolean canEdit(final CommandSender sender, final ConfigSchema.Option option) {
+         return sender.hasPermission(EDIT_PERM) || sender.hasPermission(EDIT_PERM + "." + option.path());
+     }
+ 
+-    private static boolean canViewAny(final CommandSender sender) {
++    public static boolean canViewAny(final CommandSender sender) {
+         if (sender.hasPermission(VIEW_PERM)) {
+             return true;
+         }
+@@ -89,7 +89,7 @@ public final class ConfigCommand implements KodamaSubcommand {
+         return false;
+     }
+ 
+-    private static boolean canEditAny(final CommandSender sender) {
++    public static boolean canEditAny(final CommandSender sender) {
+         if (sender.hasPermission(EDIT_PERM)) {
+             return true;
+         }
+diff --git a/src/main/java/dev/kodama/command/subcommands/GuiCommand.java b/src/main/java/dev/kodama/command/subcommands/GuiCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..de613c3f64ff3edf08ee4ead854e1431ab0c4ad8
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/GuiCommand.java
+@@ -0,0 +1,80 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.command.Completions;
++import dev.kodama.command.KodamaSubcommand;
++import dev.kodama.gui.ConfigGui;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import org.bukkit.Bukkit;
++import org.bukkit.World;
++import org.bukkit.command.CommandSender;
++import org.bukkit.entity.Player;
++import org.bukkit.permissions.Permission;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++
++/**
++ * {@code /kodama gui [world]}: the config inventory. It needs the same view permissions as {@code /kodama config get};
++ * what can be changed in it follows the edit permissions of {@code /kodama config set}.
++ */
++@DefaultQualifier(NonNull.class)
++public final class GuiCommand implements KodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "gui";
++
++    private static final String USAGE = "/kodama gui [world]";
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        if (!(sender instanceof Player player)) {
++            sender.sendMessage(text("Only players can open the config GUI.", RED));
++            return false;
++        }
++        if (!ConfigCommand.canViewAny(player)) {
++            player.sendMessage(Bukkit.permissionMessage());
++            return true;
++        }
++        if (args.length > 1) {
++            player.sendMessage(text("Usage: " + USAGE, RED));
++            return false;
++        }
++        @Nullable String worldName = null;
++        if (args.length == 1) {
++            final @Nullable World world = Bukkit.getWorld(args[0]);
++            if (world == null) {
++                player.sendMessage(text("Unknown world '" + args[0] + "'.", RED));
++                return false;
++            }
++            worldName = world.getName();
++        }
++        ConfigGui.open(player, worldName);
++        return true;
++    }
++
++    @Override
++    public List<String> tabComplete(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length > 1) {
++            return Collections.emptyList();
++        }
++        final List<String> worlds = new ArrayList<>();
++        for (final World world : Bukkit.getWorlds()) {
++            worlds.add(world.getName());
++        }
++        return Completions.matchingLast(args, worlds);
++    }
++
++    @Override
++    public boolean testPermission(final CommandSender sender) {
++        return sender instanceof Player && ConfigCommand.canViewAny(sender);
++    }
++
++    @Override
++    public List<Permission> permissions() {
++        return List.of();
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/ConfigSchema.java b/src/main/java/dev/kodama/config/ConfigSchema.java
+index b07696ca1d3903839c13448e3b97b40003748a80..129ff899b0ffbab4c03eda83dc2d551a795a88f3 100644
+--- a/src/main/java/dev/kodama/config/ConfigSchema.java
++++ b/src/main/java/dev/kodama/config/ConfigSchema.java
+@@ -1,6 +1,7 @@
+ package dev.kodama.config;
+ 
+ import io.papermc.paper.configuration.ConfigurationPart;
++import java.lang.reflect.Constructor;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Modifier;
+ import java.util.ArrayList;
+@@ -47,14 +48,53 @@ public final class ConfigSchema {
+         }
+     }
+ 
++    private final Class<?> rootType;
+     private final List<Option> options;
+     private final Map<String, String> comments;
++    private volatile @Nullable Object defaults;
+ 
+-    private ConfigSchema(final List<Option> options, final Map<String, String> comments) {
++    private ConfigSchema(final Class<?> rootType, final List<Option> options, final Map<String, String> comments) {
++        this.rootType = rootType;
+         this.options = Collections.unmodifiableList(options);
+         this.comments = Collections.unmodifiableMap(comments);
+     }
+ 
++    /**
++     * An instance of the root class with every option at its declared initial value, or {@code null} if it cannot be
++     * built. Sections are created by hand because the config mapper normally does that.
++     */
++    public @Nullable Object defaults() {
++        Object result = this.defaults;
++        if (result == null) {
++            try {
++                result = instantiate(this.rootType, null);
++                this.defaults = result;
++            } catch (final ReflectiveOperationException | RuntimeException e) {
++                return null;
++            }
++        }
++        return result;
++    }
++
++    private static Object instantiate(final Class<?> type, final @Nullable Object outer) throws ReflectiveOperationException {
++        final Constructor<?> constructor = type.getDeclaredConstructors()[0];
++        constructor.setAccessible(true);
++        final Object[] arguments = new Object[constructor.getParameterCount()];
++        if (outer != null) {
++            arguments[0] = outer;
++        }
++        final Object instance = constructor.newInstance(arguments);
++        for (final Field field : type.getDeclaredFields()) {
++            if (!Modifier.isStatic(field.getModifiers()) && !field.isSynthetic() && ConfigurationPart.class.isAssignableFrom(field.getType())) {
++                field.setAccessible(true);
++                if (field.get(instance) == null) {
++                    field.set(instance, instantiate(field.getType(), instance));
++                }
++            }
++        }
++        return instance;
++    }
++
+     /**
+      * The {@code @Comment} text of every option and section, by dotted path.
+      */
+@@ -92,7 +132,7 @@ public final class ConfigSchema {
+         final List<Option> options = new ArrayList<>();
+         final Map<String, String> comments = new LinkedHashMap<>();
+         walk(root, "", new ArrayList<>(), options, comments);
+-        return new ConfigSchema(options, comments);
++        return new ConfigSchema(root, options, comments);
+     }
+ 
+     private static void walk(final Class<?> type, final String prefix, final List<Field> chain, final List<Option> out, final Map<String, String> comments) {
+diff --git a/src/main/java/dev/kodama/gui/ConfigGui.java b/src/main/java/dev/kodama/gui/ConfigGui.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c04a10c9a5dc5e2c0386c71df93560616327715
+--- /dev/null
++++ b/src/main/java/dev/kodama/gui/ConfigGui.java
+@@ -0,0 +1,589 @@
++package dev.kodama.gui;
++
++import com.mojang.logging.LogUtils;
++import dev.kodama.command.subcommands.ConfigCommand;
++import dev.kodama.config.ConfigEditor;
++import dev.kodama.config.ConfigReloadException;
++import dev.kodama.config.ConfigSchema;
++import dev.kodama.config.ConfigTarget;
++import dev.kodama.config.Preset;
++import dev.kodama.config.PresetBoolean;
++import dev.kodama.config.PresetDouble;
++import dev.kodama.config.PresetInt;
++import dev.kodama.config.PresetValue;
++import dev.kodama.config.ReloadClass;
++import java.math.BigDecimal;
++import java.math.RoundingMode;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.format.NamedTextColor;
++import net.kyori.adventure.text.format.TextDecoration;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.bukkit.Bukkit;
++import org.bukkit.Material;
++import org.bukkit.World;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.entity.Player;
++import org.bukkit.event.inventory.ClickType;
++import org.bukkit.inventory.Inventory;
++import org.bukkit.inventory.InventoryHolder;
++import org.bukkit.inventory.ItemStack;
++import org.bukkit.inventory.meta.ItemMeta;
++import org.bukkit.plugin.Plugin;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.checkerframework.framework.qual.DefaultQualifier;
++import org.slf4j.Logger;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.AQUA;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++import static net.kyori.adventure.text.format.NamedTextColor.YELLOW;
++
++/**
++ * The {@code /kodama gui} inventory: a page of config categories, and pages of the options of one category. Every change
++ * goes through {@link ConfigEditor}, so validation, undo and the change log behave like {@code /kodama config set}.
++ * Main thread only. Only left, right, shift and drop clicks are used, which Geyser clients can all produce.
++ */
++@DefaultQualifier(NonNull.class)
++public final class ConfigGui implements InventoryHolder {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++    private static final int SIZE = 54;
++    private static final int PAGE_SIZE = 45;
++    private static final int BACK_SLOT = 45;
++    private static final int PREVIOUS_SLOT = 46;
++    private static final int NEXT_SLOT = 47;
++    private static final int WORLD_SLOT = 49;
++    private static final int REDSTONE_SLOT = 51;
++    private static final int CLOSE_SLOT = 53;
++    private static final int LORE_WIDTH = 40;
++    private static final double DECIMAL_STEP = 0.5;
++    private static final int SHIFT_FACTOR = 10;
++
++    private static boolean listenerRegistered;
++
++    private enum Kind {
++        BOOLEAN, INTEGER, DECIMAL, ENUM, OTHER
++    }
++
++    private record Category(String key, boolean global) {
++
++        ConfigSchema schema() {
++            return this.global ? ConfigSchema.GLOBAL : ConfigSchema.WORLD;
++        }
++    }
++
++    private record Entry(@Nullable Category category, ConfigSchema.@Nullable Option option, boolean global) {
++    }
++
++    private static final List<Entry> TOP_ENTRIES = topEntries();
++
++    private final Player player;
++    private final @Nullable Category category;
++    private final Inventory inventory;
++    private final Entry[] slots = new Entry[PAGE_SIZE];
++    private @Nullable String worldName;
++    private int page;
++
++    private ConfigGui(final Player player, final @Nullable Category category, final @Nullable String worldName) {
++        this.player = player;
++        this.category = category;
++        this.worldName = worldName;
++        this.inventory = Bukkit.createInventory(this, SIZE, text(category == null ? "Kodama config" : "Kodama config: " + category.key()));
++    }
++
++    @Override
++    public Inventory getInventory() {
++        return this.inventory;
++    }
++
++    /**
++     * Opens the top page. {@code worldName} is the world the world options edit, {@code null} for the world defaults.
++     */
++    public static void open(final Player player, final @Nullable String worldName) {
++        ensureListener();
++        new ConfigGui(player, null, worldName).show();
++    }
++
++    private static void ensureListener() {
++        if (!listenerRegistered) {
++            listenerRegistered = true;
++            // The server has no plugin of its own, so the listener belongs to the placeholder plugin CraftBukkit uses for its scheduler
++            final Plugin internal = new org.bukkit.craftbukkit.scheduler.MinecraftInternalPlugin();
++            Bukkit.getPluginManager().registerEvents(new ConfigGuiListener(), internal);
++        }
++    }
++
++    private static List<Entry> topEntries() {
++        final List<Entry> entries = new ArrayList<>();
++        for (final boolean global : new boolean[]{true, false}) {
++            final Set<String> sections = new LinkedHashSet<>();
++            for (final ConfigSchema.Option option : (global ? ConfigSchema.GLOBAL : ConfigSchema.WORLD).options()) {
++                final int dot = option.path().indexOf('.');
++                if (dot < 0) {
++                    entries.add(new Entry(null, option, global));
++                } else if (sections.add(option.path().substring(0, dot))) {
++                    entries.add(new Entry(new Category(option.path().substring(0, dot), global), null, global));
++                }
++            }
++        }
++        return entries;
++    }
++
++    private void show() {
++        this.render();
++        this.player.openInventory(this.inventory);
++    }
++
++    // rendering
++
++    private List<Entry> entries() {
++        final List<Entry> entries = new ArrayList<>();
++        if (this.category == null) {
++            for (final Entry entry : TOP_ENTRIES) {
++                if (entry.category() != null ? !this.visibleOptions(entry.category()).isEmpty() : ConfigCommand.canView(this.player, entry.option())) {
++                    entries.add(entry);
++                }
++            }
++        } else {
++            for (final ConfigSchema.Option option : this.visibleOptions(this.category)) {
++                entries.add(new Entry(null, option, this.category.global()));
++            }
++        }
++        return entries;
++    }
++
++    private List<ConfigSchema.Option> visibleOptions(final Category category) {
++        final List<ConfigSchema.Option> visible = new ArrayList<>();
++        for (final ConfigSchema.Option option : category.schema().under(category.key())) {
++            if (ConfigCommand.canView(this.player, option)) {
++                visible.add(option);
++            }
++        }
++        return visible;
++    }
++
++    private void render() {
++        if (this.worldName != null && Bukkit.getWorld(this.worldName) == null) {
++            this.worldName = null;
++        }
++        this.inventory.clear();
++        Arrays.fill(this.slots, null);
++
++        final List<Entry> entries = this.entries();
++        final int pages = Math.max(1, (entries.size() + PAGE_SIZE - 1) / PAGE_SIZE);
++        this.page = Math.min(this.page, pages - 1);
++        for (int i = 0; i < PAGE_SIZE; i++) {
++            final int index = this.page * PAGE_SIZE + i;
++            if (index >= entries.size()) {
++                break;
++            }
++            final Entry entry = entries.get(index);
++            this.slots[i] = entry;
++            this.inventory.setItem(i, entry.category() != null ? this.categoryItem(entry.category()) : this.optionItem(entry));
++        }
++
++        if (this.category != null) {
++            this.inventory.setItem(BACK_SLOT, button(Material.ARROW, "Back", AQUA));
++        }
++        if (this.page > 0) {
++            this.inventory.setItem(PREVIOUS_SLOT, button(Material.SPECTRAL_ARROW, "Previous page", YELLOW, "Page " + this.page + " of " + pages));
++        }
++        if (this.page < pages - 1) {
++            this.inventory.setItem(NEXT_SLOT, button(Material.SPECTRAL_ARROW, "Next page", YELLOW, "Page " + (this.page + 2) + " of " + pages));
++        }
++        this.inventory.setItem(WORLD_SLOT, this.worldItem());
++        if (this.category == null && this.redstoneAvailable()) {
++            this.inventory.setItem(REDSTONE_SLOT, this.redstoneItem());
++        }
++        this.inventory.setItem(CLOSE_SLOT, button(Material.BARRIER, "Close", RED));
++    }
++
++    private ItemStack categoryItem(final Category category) {
++        final List<Component> lore = new ArrayList<>();
++        addWrapped(lore, category.schema().comments().get(category.key()));
++        lore.add(line(""));
++        lore.add(line("Options: " + this.visibleOptions(category).size(), GRAY));
++        lore.add(line("Click to open", YELLOW));
++        return item(categoryMaterial(category.key()), text(category.key(), AQUA), lore);
++    }
++
++    private static Material categoryMaterial(final String key) {
++        return switch (key) {
++            case "chunk-loading" -> Material.GRASS_BLOCK;
++            case "network" -> Material.ENDER_PEARL;
++            case "async" -> Material.CLOCK;
++            case "precache" -> Material.MAP;
++            case "feature-safety" -> Material.SHIELD;
++            case "mob-lod" -> Material.ZOMBIE_HEAD;
++            case "redstone" -> Material.REDSTONE;
++            case "hoppers" -> Material.HOPPER;
++            default -> Material.BOOK;
++        };
++    }
++
++    private ItemStack optionItem(final Entry entry) {
++        final ConfigSchema.Option option = entry.option();
++        final ConfigTarget target = this.target(entry.global());
++        final Kind kind = kindOf(option.valueType());
++        final boolean editable = ConfigCommand.canEdit(this.player, option);
++        final String name = this.category == null ? option.path() : option.path().substring(this.category.key().length() + 1);
++
++        @Nullable Object current = null;
++        String shown;
++        try {
++            final MinecraftServer server = MinecraftServer.getServer();
++            current = server.kodamaConfigurations.currentValue(server, target, option);
++            shown = ConfigEditor.display(current);
++        } catch (final ConfigReloadException exception) {
++            shown = "unavailable";
++        }
++
++        final List<Component> lore = new ArrayList<>();
++        lore.add(line("Value: ", GRAY, shown, WHITE));
++        final @Nullable String defaultValue = defaultOf(option, entry.global());
++        if (defaultValue != null) {
++            lore.add(line("Default: ", GRAY, defaultValue, WHITE));
++        }
++        lore.add(line("Reload: ", GRAY, option.reloadClass().label(), option.reloadClass() == ReloadClass.IMMEDIATE ? WHITE : YELLOW));
++        lore.add(line("File: ", GRAY, target.fileName(), WHITE));
++        if (option.comment() != null) {
++            lore.add(line(""));
++            addWrapped(lore, option.comment());
++        }
++        lore.add(line(""));
++        if (!editable) {
++            lore.add(line("Read only: you may not change this option.", RED));
++        } else {
++            addHelp(lore, option, kind);
++        }
++
++        final Material material;
++        if (!editable) {
++            material = Material.PAPER;
++        } else {
++            material = switch (kind) {
++                case BOOLEAN -> effectiveBoolean(current) ? Material.LIME_WOOL : Material.RED_WOOL;
++                case INTEGER -> Material.GOLD_INGOT;
++                case DECIMAL -> Material.AMETHYST_SHARD;
++                case ENUM -> Material.COMPARATOR;
++                case OTHER -> Material.PAPER;
++            };
++        }
++        return item(material, text(name, YELLOW), lore);
++    }
++
++    private static @Nullable String defaultOf(final ConfigSchema.Option option, final boolean global) {
++        final @Nullable Object defaults = (global ? ConfigSchema.GLOBAL : ConfigSchema.WORLD).defaults();
++        if (defaults == null) {
++            return null;
++        }
++        final @Nullable Object value = option.read(defaults);
++        if (value instanceof PresetValue<?> preset) {
++            return ConfigEditor.display(preset.defaultFor(Preset.current())) + " (preset " + Preset.current().key() + ")";
++        }
++        return ConfigEditor.display(value);
++    }
++
++    private static void addHelp(final List<Component> lore, final ConfigSchema.Option option, final Kind kind) {
++        switch (kind) {
++            case BOOLEAN -> lore.add(line("Click: switch on or off", YELLOW));
++            case INTEGER -> {
++                lore.add(line("Left click: +1, right click: -1", YELLOW));
++                lore.add(line("Hold shift for steps of " + SHIFT_FACTOR, YELLOW));
++            }
++            case DECIMAL -> {
++                lore.add(line("Left click: +" + DECIMAL_STEP + ", right click: -" + DECIMAL_STEP, YELLOW));
++                lore.add(line("Hold shift for steps of " + DECIMAL_STEP * SHIFT_FACTOR, YELLOW));
++            }
++            case ENUM -> lore.add(line("Left click: next, right click: previous", YELLOW));
++            case OTHER -> lore.add(line("Use /kodama config set to change this.", YELLOW));
++        }
++        if (PresetValue.class.isAssignableFrom(option.valueType()) && kind != Kind.OTHER) {
++            lore.add(line("Drop (Q): reset to default", YELLOW));
++        }
++    }
++
++    private ItemStack worldItem() {
++        final ConfigTarget target = this.target(false);
++        final List<Component> lore = new ArrayList<>();
++        lore.add(line("World options are edited in:", GRAY));
++        lore.add(line(target.fileName(), WHITE));
++        lore.add(line(""));
++        lore.add(line("Left click: next world, right click: previous", YELLOW));
++        return item(Material.COMPASS, text("World: " + (this.worldName == null ? "world defaults" : this.worldName), AQUA), lore);
++    }
++
++    private boolean redstoneAvailable() {
++        boolean mayEdit = false;
++        for (final ConfigSchema.Option option : ConfigSchema.WORLD.under("redstone")) {
++            if (ConfigCommand.canEdit(this.player, option)) {
++                mayEdit = true;
++                break;
++            }
++        }
++        return mayEdit && this.playerLevel().kodamaRedstone.isActive();
++    }
++
++    private ItemStack redstoneItem() {
++        final int chunkX = this.player.getLocation().getBlockX() >> 4;
++        final int chunkZ = this.player.getLocation().getBlockZ() >> 4;
++        final boolean alternateCurrent = this.playerLevel().kodamaRedstone.usesAlternateCurrent(chunkX, chunkZ);
++        final List<Component> lore = new ArrayList<>();
++        lore.add(line("Chunk " + chunkX + " " + chunkZ + " in " + this.player.getWorld().getName(), GRAY));
++        lore.add(line("Now: ", GRAY, alternateCurrent ? "Alternate Current" : "world setting", WHITE));
++        lore.add(line(""));
++        lore.add(line(alternateCurrent ? "Click: back to the world setting" : "Click: switch to Alternate Current", YELLOW));
++        return item(alternateCurrent ? Material.REDSTONE_BLOCK : Material.REDSTONE, text("Redstone of this chunk", AQUA), lore);
++    }
++
++    private ServerLevel playerLevel() {
++        return ((CraftWorld) this.player.getWorld()).getHandle();
++    }
++
++    private ConfigTarget target(final boolean global) {
++        if (global) {
++            return ConfigTarget.GLOBAL;
++        }
++        return this.worldName == null ? ConfigTarget.WORLD_DEFAULTS : ConfigTarget.world(this.worldName);
++    }
++
++    // clicks
++
++    void click(final ClickType click, final int slot) {
++        if (!this.player.isOnline()) {
++            return;
++        }
++        if (slot >= 0 && slot < PAGE_SIZE) {
++            final @Nullable Entry entry = this.slots[slot];
++            if (entry == null) {
++                return;
++            }
++            if (entry.category() != null) {
++                new ConfigGui(this.player, entry.category(), this.worldName).show();
++            } else {
++                this.clickOption(entry, click);
++            }
++            return;
++        }
++        switch (slot) {
++            case BACK_SLOT -> {
++                if (this.category != null) {
++                    new ConfigGui(this.player, null, this.worldName).show();
++                }
++            }
++            case PREVIOUS_SLOT -> {
++                this.page = Math.max(0, this.page - 1);
++                this.render();
++            }
++            case NEXT_SLOT -> {
++                this.page++;
++                this.render();
++            }
++            case WORLD_SLOT -> {
++                this.cycleWorld(click.isRightClick() ? -1 : 1);
++                this.render();
++            }
++            case REDSTONE_SLOT -> this.clickRedstone();
++            case CLOSE_SLOT -> this.player.closeInventory();
++            default -> {
++            }
++        }
++    }
++
++    private void cycleWorld(final int direction) {
++        final List<String> names = new ArrayList<>();
++        for (final World world : Bukkit.getWorlds()) {
++            names.add(world.getName());
++        }
++        final int position = this.worldName == null ? 0 : names.indexOf(this.worldName) + 1;
++        final int next = Math.floorMod(position + direction, names.size() + 1);
++        this.worldName = next == 0 ? null : names.get(next - 1);
++    }
++
++    private void clickRedstone() {
++        if (!this.redstoneAvailable()) {
++            this.render();
++            return;
++        }
++        final int chunkX = this.player.getLocation().getBlockX() >> 4;
++        final int chunkZ = this.player.getLocation().getBlockZ() >> 4;
++        final boolean alternateCurrent = !this.playerLevel().kodamaRedstone.usesAlternateCurrent(chunkX, chunkZ);
++        if (this.playerLevel().kodamaRedstone.requestSwitch(chunkX, chunkZ, alternateCurrent, this.player)) {
++            this.player.sendMessage(text("Switching chunk " + chunkX + " " + chunkZ + " to " + (alternateCurrent ? "Alternate Current" : "the world setting")
++                + " once its redstone is quiet.", GREEN));
++        } else {
++            this.player.sendMessage(text("Chunk " + chunkX + " " + chunkZ + " is not loaded.", RED));
++        }
++        this.render();
++    }
++
++    private void clickOption(final Entry entry, final ClickType click) {
++        final ConfigSchema.Option option = entry.option();
++        if (!ConfigCommand.canView(this.player, option)) {
++            this.render();
++            return;
++        }
++        if (!ConfigCommand.canEdit(this.player, option)) {
++            this.player.sendMessage(text("You may not change " + option.path() + ".", RED));
++            return;
++        }
++        final ConfigTarget target = this.target(entry.global());
++        final @Nullable String input;
++        try {
++            final MinecraftServer server = MinecraftServer.getServer();
++            input = nextInput(option, server.kodamaConfigurations.currentValue(server, target, option), click);
++        } catch (final ConfigReloadException exception) {
++            this.player.sendMessage(text("Cannot read " + option.path() + ": " + exception.getMessage(), RED));
++            return;
++        }
++        if (input == null) {
++            return;
++        }
++        try {
++            final ConfigEditor.Result result = ConfigEditor.set(this.player, target, option, input);
++            if (!result.unchanged()) {
++                final Component message = text("Set " + option.path() + ": ", GREEN).append(text(result.oldDisplay(), WHITE))
++                    .append(text(" -> ", GRAY)).append(text(result.newDisplay(), WHITE));
++                this.player.sendMessage(option.reloadClass() == ReloadClass.RESTART_REQUIRED
++                    ? message.append(text(" (takes effect after restart)", YELLOW)) : message);
++            }
++        } catch (final IllegalArgumentException exception) {
++            this.player.sendMessage(text("Not changed: " + exception.getMessage(), RED));
++        } catch (final ConfigReloadException exception) {
++            this.player.sendMessage(text("Not changed, the value is not valid: " + exception.getMessage(), RED));
++        }
++        this.render();
++    }
++
++    /**
++     * The text to hand to {@link ConfigEditor#set} for this click, or {@code null} when the click changes nothing.
++     */
++    private static @Nullable String nextInput(final ConfigSchema.Option option, final @Nullable Object current, final ClickType click) {
++        final Kind kind = kindOf(option.valueType());
++        if (kind == Kind.OTHER) {
++            return null;
++        }
++        if (click == ClickType.DROP || click == ClickType.CONTROL_DROP) {
++            return PresetValue.class.isAssignableFrom(option.valueType()) ? PresetValue.DEFAULT_VALUE : null;
++        }
++        if (!click.isLeftClick() && !click.isRightClick()) {
++            return null;
++        }
++        final int sign = click.isLeftClick() ? 1 : -1;
++        final int factor = click.isShiftClick() ? SHIFT_FACTOR : 1;
++        final @Nullable Object value = current instanceof PresetValue<?> preset ? preset.get() : current;
++        switch (kind) {
++            case BOOLEAN -> {
++                return Boolean.toString(!effectiveBoolean(current));
++            }
++            case INTEGER -> {
++                return value instanceof Number number ? Long.toString(number.longValue() + (long) sign * factor) : null;
++            }
++            case DECIMAL -> {
++                if (!(value instanceof Number number)) {
++                    return null;
++                }
++                // Rounded so that repeated steps do not drift into 0.30000000000000004
++                return BigDecimal.valueOf(number.doubleValue() + sign * factor * DECIMAL_STEP).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
++            }
++            case ENUM -> {
++                final List<String> values = ConfigEditor.valueSuggestions(option);
++                if (values.isEmpty()) {
++                    return null;
++                }
++                final int index = values.indexOf(ConfigEditor.display(current));
++                return values.get(Math.floorMod(index + sign, values.size()));
++            }
++            default -> {
++                return null;
++            }
++        }
++    }
++
++    private static boolean effectiveBoolean(final @Nullable Object value) {
++        if (value instanceof PresetBoolean preset) {
++            return preset.isTrue();
++        }
++        return value instanceof Boolean bool && bool;
++    }
++
++    private static Kind kindOf(final Class<?> type) {
++        if (type == boolean.class || type == Boolean.class || type == PresetBoolean.class) {
++            return Kind.BOOLEAN;
++        }
++        if (type == int.class || type == Integer.class || type == long.class || type == Long.class || type == PresetInt.class) {
++            return Kind.INTEGER;
++        }
++        if (type == double.class || type == Double.class || type == float.class || type == Float.class || type == PresetDouble.class) {
++            return Kind.DECIMAL;
++        }
++        return type.isEnum() ? Kind.ENUM : Kind.OTHER;
++    }
++
++    // items
++
++    private static ItemStack button(final Material material, final String name, final NamedTextColor color, final String... lore) {
++        final List<Component> lines = new ArrayList<>();
++        for (final String text : lore) {
++            lines.add(line(text, GRAY));
++        }
++        return item(material, text(name, color), lines);
++    }
++
++    private static ItemStack item(final Material material, final Component name, final List<Component> lore) {
++        final ItemStack stack = new ItemStack(material);
++        final ItemMeta meta = stack.getItemMeta();
++        meta.displayName(name.decoration(TextDecoration.ITALIC, false));
++        meta.lore(lore);
++        stack.setItemMeta(meta);
++        return stack;
++    }
++
++    private static Component line(final String text) {
++        return line(text, GRAY);
++    }
++
++    private static Component line(final String text, final NamedTextColor color) {
++        return text(text, color).decoration(TextDecoration.ITALIC, false);
++    }
++
++    private static Component line(final String label, final NamedTextColor labelColor, final String value, final NamedTextColor valueColor) {
++        return text(label, labelColor).decoration(TextDecoration.ITALIC, false).append(text(value, valueColor));
++    }
++
++    private static void addWrapped(final List<Component> lore, final @Nullable String comment) {
++        if (comment == null) {
++            return;
++        }
++        for (final String paragraph : comment.split("\n")) {
++            final StringBuilder current = new StringBuilder();
++            for (final String word : paragraph.split(" ")) {
++                if (current.length() > 0 && current.length() + 1 + word.length() > LORE_WIDTH) {
++                    lore.add(line(current.toString(), GRAY));
++                    current.setLength(0);
++                }
++                if (current.length() > 0) {
++                    current.append(' ');
++                }
++                current.append(word);
++            }
++            if (current.length() > 0) {
++                lore.add(line(current.toString(), GRAY));
++            }
++        }
++    }
++
++    static void logFailure(final Throwable throwable) {
++        LOGGER.warn("Kodama config GUI failed", throwable);
++    }
++}
+diff --git a/src/main/java/dev/kodama/gui/ConfigGuiListener.java b/src/main/java/dev/kodama/gui/ConfigGuiListener.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e9ff8b9d2996e20dcce7cac2f3b14bb5f4a01c7
+--- /dev/null
++++ b/src/main/java/dev/kodama/gui/ConfigGuiListener.java
+@@ -0,0 +1,41 @@
++package dev.kodama.gui;
++
++import org.bukkit.entity.Player;
++import org.bukkit.event.EventHandler;
++import org.bukkit.event.EventPriority;
++import org.bukkit.event.Listener;
++import org.bukkit.event.inventory.InventoryClickEvent;
++import org.bukkit.event.inventory.InventoryDragEvent;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++/**
++ * Keeps items in {@link ConfigGui} inventories and forwards clicks to it. Deliberately no other event types: the hopper
++ * optimizations switch themselves off while anything listens to inventory move events.
++ */
++@DefaultQualifier(NonNull.class)
++final class ConfigGuiListener implements Listener {
++
++    @EventHandler(priority = EventPriority.HIGHEST)
++    public void onClick(final InventoryClickEvent event) {
++        // The exception handler of the internal plugin cannot log, so nothing may escape from here
++        try {
++            if (!(event.getView().getTopInventory().getHolder() instanceof ConfigGui gui)) {
++                return;
++            }
++            event.setCancelled(true);
++            if (event.getClickedInventory() == event.getView().getTopInventory() && event.getWhoClicked() instanceof Player) {
++                gui.click(event.getClick(), event.getSlot());
++            }
++        } catch (final Throwable throwable) {
++            ConfigGui.logFailure(throwable);
++        }
++    }
++
++    @EventHandler(priority = EventPriority.HIGHEST)
++    public void onDrag(final InventoryDragEvent event) {
++        if (event.getView().getTopInventory().getHolder() instanceof ConfigGui) {
++            event.setCancelled(true);
++        }
++    }
++}

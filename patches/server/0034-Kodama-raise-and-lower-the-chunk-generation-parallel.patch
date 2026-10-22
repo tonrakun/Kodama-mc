@@ -1,0 +1,318 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 07:46:03 +0900
+Subject: [PATCH] Kodama: raise and lower the chunk generation parallelism with
+ the tick time
+
+
+diff --git a/src/main/java/ca/spottedleaf/concurrentutil/executor/standard/PrioritisedThreadPool.java b/src/main/java/ca/spottedleaf/concurrentutil/executor/standard/PrioritisedThreadPool.java
+index 26fa2caa18a9194e57574a4a7fa9f7a4265740e0..ad3b14b458ecd66ed215a05a62fc983dfc5eb575 100644
+--- a/src/main/java/ca/spottedleaf/concurrentutil/executor/standard/PrioritisedThreadPool.java
++++ b/src/main/java/ca/spottedleaf/concurrentutil/executor/standard/PrioritisedThreadPool.java
+@@ -320,6 +320,14 @@ public final class PrioritisedThreadPool {
+          * this queue is not halted and not shutdown.
+          */
+         public boolean isActive();
++
++        // Kodama start - dynamic generation parallelism
++        /**
++         * Changes how many threads may run tasks of this executor at the same time (at most the pool size).
++         */
++        public default void kodamaSetParallelism(final int parallelism) {
++        }
++        // Kodama end - dynamic generation parallelism
+     }
+ 
+     protected static final class PrioritisedPoolExecutorImpl extends PrioritisedThreadedTaskQueue implements PrioritisedPoolExecutor {
+@@ -331,7 +339,7 @@ public final class PrioritisedThreadPool {
+         protected Priority scheduledPriority;
+ 
+         protected final String name;
+-        protected final int maximumExecutors;
++        protected int maximumExecutors; // Kodama - dynamic generation parallelism - not final, guarded by the pool's queues
+         protected boolean isQueued;
+ 
+         public PrioritisedPoolExecutorImpl(final PrioritisedThreadPool pool, final String name, final int maximumExecutors) {
+@@ -365,6 +373,37 @@ public final class PrioritisedThreadPool {
+ 
+         private boolean isHalted;
+ 
++        // Kodama start - dynamic generation parallelism
++        @Override
++        public void kodamaSetParallelism(final int parallelism) {
++            final PrioritisedThreadPool pool = this.pool;
++            final TreeSet<PrioritisedPoolExecutorImpl> queues = pool.queues;
++            final int executorsWanted;
++            synchronized (queues) {
++                final int clamped = Math.min(Math.max(1, parallelism), pool.threads.length);
++                if (clamped == this.maximumExecutors) {
++                    return;
++                }
++                this.maximumExecutors = clamped;
++                // a queue at its old limit was left out of the set, so idle threads would never pick it up
++                if (!this.isQueued && !this.isHalted && this.scheduledPriority != null && this.concurrentExecutors < clamped) {
++                    queues.add(this);
++                    this.isQueued = true;
++                }
++                executorsWanted = this.isQueued ? Math.min(clamped - this.concurrentExecutors, (int)this.totalQueuedTasks) : 0;
++            }
++            int notified = 0;
++            for (final PrioritisedThread thread : pool.threads) {
++                if (notified >= executorsWanted) {
++                    break;
++                }
++                if (thread.notifyTasks()) {
++                    ++notified;
++                }
++            }
++        }
++        // Kodama end - dynamic generation parallelism
++
+         @Override
+         public void halt() {
+             final PrioritisedThreadPool pool = this.pool;
+diff --git a/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java b/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
+index f40bf05de2ee32e6e74c1de6e0a007cb83656423..a85cdfdac237c3be104bae018f3fb2be66d61f1e 100644
+--- a/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
++++ b/src/main/java/dev/kodama/chunk/ChunkLoadingStatus.java
+@@ -25,6 +25,17 @@ public final class ChunkLoadingStatus {
+     public static void register() {
+         dev.kodama.chunk.adaptive.AdaptiveStatus.register();
+         dev.kodama.chunk.packetcache.PacketCacheStatus.register();
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Generation";
++            }
++
++            @Override
++            public Component describe() {
++                return text(GenerationThreads.describe(), GRAY);
++            }
++        });
+         StatusCommand.register(new StatusContributor() {
+             @Override
+             public String label() {
+diff --git a/src/main/java/dev/kodama/chunk/GenerationThreads.java b/src/main/java/dev/kodama/chunk/GenerationThreads.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c0f26cbc2ba45a1918fb3bb5d4ada2dfeadb443b
+--- /dev/null
++++ b/src/main/java/dev/kodama/chunk/GenerationThreads.java
+@@ -0,0 +1,76 @@
++package dev.kodama.chunk;
++
++import dev.kodama.config.KodamaGlobalConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import io.papermc.paper.chunk.system.scheduling.ChunkTaskScheduler;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++/**
++ * Raises the number of chunk generation tasks that may run at once while the server has spare time, and lowers it while
++ * ticks are slow. Starts at Paper's parallelism; the upper limit is the worker pool, which Kodama sizes larger than
++ * Paper when worker-threads is left at its default. Checked once per second on the main thread.
++ */
++public final class GenerationThreads {
++
++    public static final String FEATURE_ID = "generation-threads";
++    private static final int INTERVAL_TICKS = 20;
++
++    private static int parallelism = -1;
++
++    private GenerationThreads() {
++    }
++
++    private static KodamaGlobalConfiguration.ChunkLoading.@Nullable GenerationThreads section() {
++        final KodamaGlobalConfiguration config = KodamaGlobalConfiguration.get();
++        return config == null || config.chunkLoading == null ? null : config.chunkLoading.generationThreads;
++    }
++
++    static boolean enabled() {
++        final KodamaGlobalConfiguration.ChunkLoading.GenerationThreads section = section();
++        return ChunkLoadingSettings.masterEnabled() && section != null && section.enabled.isTrue() && !FeatureGuard.isTripped(FEATURE_ID);
++    }
++
++    public static void tick(final MinecraftServer server) {
++        if (server.getTickCount() % INTERVAL_TICKS != 0) {
++            return;
++        }
++        try {
++            final int base = ChunkTaskScheduler.kodamaBaseGenParallelism();
++            final int max = ChunkTaskScheduler.kodamaMaxGenParallelism();
++            int target;
++            if (!enabled()) {
++                target = base;
++            } else {
++                final KodamaGlobalConfiguration.ChunkLoading.GenerationThreads section = section();
++                final double mspt = server.tickTimes5s.getAverage();
++                final int current = parallelism < 0 ? base : parallelism;
++                if (server.getPlayerCount() == 0) {
++                    target = max;
++                } else if (mspt > section.slowMspt) {
++                    target = Math.max(1, current - 1);
++                } else if (mspt < section.fastMspt) {
++                    target = Math.min(max, current + 1);
++                } else {
++                    target = current;
++                }
++            }
++            parallelism = target;
++            // also reaches worlds loaded later; does nothing for worlds already at the target
++            for (final ServerLevel level : server.getAllLevels()) {
++                level.chunkTaskScheduler.kodamaSetGenParallelism(target);
++            }
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(FEATURE_ID, throwable);
++        }
++    }
++
++    public static String describe() {
++        return "generation parallelism " + (parallelism < 0 ? ChunkTaskScheduler.kodamaBaseGenParallelism() : parallelism)
++            + " (Paper " + ChunkTaskScheduler.kodamaBaseGenParallelism() + ", up to " + ChunkTaskScheduler.kodamaMaxGenParallelism() + ")"
++            + (enabled() ? "" : ", dynamic control off");
++    }
++}
+diff --git a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+index fe90c0b571544f6fae9212b3aa8c54b408347c01..66103a9d43ee01eebec40cdc0da45c691cff1002 100644
+--- a/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaGlobalConfiguration.java
+@@ -153,6 +153,23 @@ public class KodamaGlobalConfiguration extends ConfigurationPart {
+             public int minPerPlayer = 20;
+         }
+ 
++        @Comment("Lets more chunks generate at the same time while ticks are fast and fewer while they are slow. With worker-threads left at -1\n"
++            + "in the Paper global config, Kodama starts more worker threads than Paper that only generate while there is time for it.")
++        public GenerationThreads generationThreads;
++
++        public class GenerationThreads extends ConfigurationPart {
++            @Comment("Enables the dynamic generation parallelism. When off, generation runs with Paper's parallelism.")
++            public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++            @Comment("Average tick time, in milliseconds over the last 5 seconds, above which one fewer chunk generates at a time (down to 1).")
++            @Constraint(Constraints.Positive.class)
++            public double slowMspt = 40.0;
++
++            @Comment("Average tick time below which one more chunk generates at a time. With nobody online the upper limit is used.")
++            @Constraint(Constraints.Positive.class)
++            public double fastMspt = 25.0;
++        }
++
+         @Comment("Reuses the chunk packet of a chunk for every player it is sent to instead of building it again.")
+         public PacketCache packetCache;
+ 
+diff --git a/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java b/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java
+index 00386dc05940b7a207636b08266ad3dc1687dd34..3b0eb36dddb08c123d2e3ade6e319d339ed02914 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java
++++ b/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkTaskScheduler.java
+@@ -95,10 +95,18 @@ public final class ChunkTaskScheduler {
+ 
+         ChunkTaskScheduler.newChunkSystemGenParallelism = useParallelGen ? newChunkSystemWorkerThreads : 1;
+         ChunkTaskScheduler.newChunkSystemLoadParallelism = newChunkSystemWorkerThreads;
++        // Kodama start - dynamic generation parallelism - spare threads that only generate while the server has time for it;
++        // the Kodama config is not loaded yet, so the pool is sized here and the executors start at Paper's parallelism
++        int kodamaPoolThreads = newChunkSystemWorkerThreads;
++        if (config.workerThreads < 0 && Integer.getInteger("Paper.WorkerThreadCount") == null && useParallelGen) {
++            kodamaPoolThreads = Math.max(newChunkSystemWorkerThreads, (Runtime.getRuntime().availableProcessors() * 3) / 4 - 1);
++        }
++        ChunkTaskScheduler.kodamaMaxGenParallelism = useParallelGen ? kodamaPoolThreads : 1;
++        // Kodama end - dynamic generation parallelism
+ 
+         RegionFileIOThread.init(newChunkSystemIOThreads);
+         workerThreads = new ca.spottedleaf.concurrentutil.executor.standard.PrioritisedThreadPool(
+-            "Paper Chunk System Worker Pool", newChunkSystemWorkerThreads,
++            "Paper Chunk System Worker Pool", kodamaPoolThreads, // Kodama - dynamic generation parallelism
+             (final Thread thread, final Integer id) -> {
+                 thread.setPriority(Thread.NORM_PRIORITY - 2);
+                 thread.setName("Tuinity Chunk System Worker #" + id.intValue());
+@@ -106,7 +114,39 @@ public final class ChunkTaskScheduler {
+             }, (long)(20.0e6)); // 20ms
+ 
+         LOGGER.info("Chunk system is using " + newChunkSystemIOThreads + " I/O threads, " + newChunkSystemWorkerThreads + " worker threads, and gen parallelism of " + ChunkTaskScheduler.newChunkSystemGenParallelism + " threads");
++        if (kodamaPoolThreads > newChunkSystemWorkerThreads) LOGGER.info("Kodama keeps " + (kodamaPoolThreads - newChunkSystemWorkerThreads) + " more worker threads for generation while the server has time for it"); // Kodama - dynamic generation parallelism
++    }
++
++    // Kodama start - dynamic generation parallelism
++    private static int kodamaMaxGenParallelism = 1;
++    private volatile int kodamaGenParallelism = -1;
++
++    public static int kodamaBaseGenParallelism() {
++        return Math.max(1, newChunkSystemGenParallelism);
++    }
++
++    public static int kodamaMaxGenParallelism() {
++        return Math.max(kodamaBaseGenParallelism(), kodamaMaxGenParallelism);
++    }
++
++    public int kodamaGenParallelism() {
++        final int current = this.kodamaGenParallelism;
++        return current < 0 ? kodamaBaseGenParallelism() : current;
++    }
++
++    public void kodamaSetGenParallelism(final int parallelism) {
++        final int clamped = Math.max(1, Math.min(parallelism, kodamaMaxGenParallelism()));
++        if (clamped == this.kodamaGenParallelism()) {
++            return;
++        }
++        this.kodamaGenParallelism = clamped;
++        this.parallelGenExecutor.kodamaSetParallelism(clamped);
++        if (this.radiusAwareGenExecutor != this.parallelGenExecutor) {
++            this.radiusAwareGenExecutor.kodamaSetParallelism(clamped);
++        }
++        this.radiusAwareScheduler.kodamaSetMaxToSchedule(clamped);
+     }
++    // Kodama end - dynamic generation parallelism
+ 
+     public final ServerLevel world;
+     public final PrioritisedThreadPool workers;
+diff --git a/src/main/java/io/papermc/paper/chunk/system/scheduling/queue/RadiusAwarePrioritisedExecutor.java b/src/main/java/io/papermc/paper/chunk/system/scheduling/queue/RadiusAwarePrioritisedExecutor.java
+index f7b0e2564ac4bd2db1d2b2bdc230c9f52f8a21b7..aceadd289196ecc6365cf276980dc58fb5fb23dd 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/scheduling/queue/RadiusAwarePrioritisedExecutor.java
++++ b/src/main/java/io/papermc/paper/chunk/system/scheduling/queue/RadiusAwarePrioritisedExecutor.java
+@@ -26,6 +26,23 @@ public class RadiusAwarePrioritisedExecutor {
+         }
+     }
+ 
++    // Kodama start - dynamic generation parallelism
++    public void kodamaSetMaxToSchedule(final int maxToSchedule) {
++        final List<PrioritisedExecutor.PrioritisedTask> toSchedule;
++        synchronized (this) {
++            for (final DependencyTree tree : this.queues) {
++                tree.maxToSchedule = Math.max(1, maxToSchedule);
++            }
++            toSchedule = this.selectedQueue != NO_TASKS_QUEUED && this.canQueueTasks ? this.queues[this.selectedQueue].tryPushTasks() : null;
++        }
++        if (toSchedule != null) {
++            for (int i = 0, len = toSchedule.size(); i < len; ++i) {
++                toSchedule.get(i).queue();
++            }
++        }
++    }
++    // Kodama end - dynamic generation parallelism
++
+     private boolean canQueueTasks() {
+         return this.canQueueTasks;
+     }
+@@ -148,7 +165,7 @@ public class RadiusAwarePrioritisedExecutor {
+ 
+         private final RadiusAwarePrioritisedExecutor scheduler;
+         private final PrioritisedExecutor executor;
+-        private final int maxToSchedule;
++        private int maxToSchedule; // Kodama - dynamic generation parallelism - not final
+         private final int treeIndex;
+ 
+         private int currentlyExecuting;
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index e8034ec57a10f2d1802f2a6781473f80da0122ef..0da86a4db688090a4939786976bc0e04c711cd65 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -1698,6 +1698,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     }
+ 
+     public void tickChildren(BooleanSupplier shouldKeepTicking) {
++        dev.kodama.chunk.GenerationThreads.tick(this); // Kodama - dynamic generation parallelism
+         this.getPlayerList().getPlayers().forEach((entityplayer) -> {
+             entityplayer.connection.suspendFlushing();
+         });
