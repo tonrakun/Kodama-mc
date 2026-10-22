@@ -1,0 +1,846 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 07:16:12 +0900
+Subject: [PATCH] Kodama: monitor redstone activity per chunk and switch single
+ chunks to Alternate Current
+
+
+diff --git a/src/main/java/dev/kodama/command/KodamaCommand.java b/src/main/java/dev/kodama/command/KodamaCommand.java
+index 605e73ef17fc95042b97229a4afe0e8e3a4a4cbb..320ed4ac7227d3a99871b973deb42bc5157b4dbd 100644
+--- a/src/main/java/dev/kodama/command/KodamaCommand.java
++++ b/src/main/java/dev/kodama/command/KodamaCommand.java
+@@ -3,6 +3,7 @@ package dev.kodama.command;
+ import dev.kodama.command.subcommands.ConfigCommand;
+ import dev.kodama.command.subcommands.LodCommand;
+ import dev.kodama.command.subcommands.PrecacheCommand;
++import dev.kodama.command.subcommands.RedstoneCommand;
+ import dev.kodama.command.subcommands.ReloadCommand;
+ import dev.kodama.command.subcommands.StatusCommand;
+ import dev.kodama.command.subcommands.VersionCommand;
+@@ -44,6 +45,7 @@ public final class KodamaCommand extends Command {
+         SUBCOMMANDS.put(ConfigCommand.LITERAL_ARGUMENT, new ConfigCommand());
+         SUBCOMMANDS.put(PrecacheCommand.LITERAL_ARGUMENT, new PrecacheCommand());
+         SUBCOMMANDS.put(LodCommand.LITERAL_ARGUMENT, new LodCommand());
++        SUBCOMMANDS.put(RedstoneCommand.LITERAL_ARGUMENT, new RedstoneCommand());
+     }
+ 
+     public KodamaCommand() {
+diff --git a/src/main/java/dev/kodama/command/subcommands/RedstoneCommand.java b/src/main/java/dev/kodama/command/subcommands/RedstoneCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..499acbbb990ccefc3da7c8849cacfdc26d9e4372
+--- /dev/null
++++ b/src/main/java/dev/kodama/command/subcommands/RedstoneCommand.java
+@@ -0,0 +1,228 @@
++package dev.kodama.command.subcommands;
++
++import dev.kodama.command.Completions;
++import dev.kodama.command.KodamaCommands;
++import dev.kodama.command.PermissionedKodamaSubcommand;
++import dev.kodama.config.KodamaConfigurations;
++import dev.kodama.redstone.RedstoneMonitor;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Locale;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import org.bukkit.Bukkit;
++import org.bukkit.Location;
++import org.bukkit.World;
++import org.bukkit.command.CommandSender;
++import org.bukkit.entity.Player;
++import org.bukkit.permissions.Permission;
++import org.bukkit.permissions.PermissionDefault;
++import org.checkerframework.checker.nullness.qual.NonNull;
++import org.checkerframework.checker.nullness.qual.Nullable;
++import org.checkerframework.framework.qual.DefaultQualifier;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++/**
++ * {@code /kodama redstone top|info|set}: the redstone activity of chunks, and switching single chunks to Alternate
++ * Current. Chunks are given as chunk coordinates; players default to the chunk they stand in.
++ */
++@DefaultQualifier(NonNull.class)
++public final class RedstoneCommand extends PermissionedKodamaSubcommand {
++
++    public static final String LITERAL_ARGUMENT = "redstone";
++    public static final String PERM = KodamaCommands.COMMAND_BASE_PERM + "." + LITERAL_ARGUMENT;
++
++    private static final List<String> ACTIONS = List.of("top", "info", "set");
++    private static final List<String> MODES = List.of("alternate-current", "vanilla");
++    private static final String TOP_USAGE = "/kodama redstone top [count] [world]";
++    private static final String INFO_USAGE = "/kodama redstone info [chunkX chunkZ [world]]";
++    private static final String SET_USAGE = "/kodama redstone set <alternate-current|vanilla> [chunkX chunkZ [world]]";
++    private static final int DEFAULT_TOP = 10;
++
++    public RedstoneCommand() {
++        super(PERM, PermissionDefault.OP);
++    }
++
++    @Override
++    public List<Permission> permissions() {
++        return List.of(this.permission, new Permission(RedstoneMonitor.NOTIFY_PERMISSION, "Receives Kodama reports about redstone clocks", PermissionDefault.OP));
++    }
++
++    @Override
++    public boolean execute(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length == 0) {
++            sendUsage(sender);
++            return false;
++        }
++        final String[] rest = java.util.Arrays.copyOfRange(args, 1, args.length);
++        return switch (args[0].toLowerCase(Locale.ROOT)) {
++            case "top" -> this.top(sender, rest);
++            case "info" -> this.info(sender, rest);
++            case "set" -> this.set(sender, rest);
++            default -> {
++                sendUsage(sender);
++                yield false;
++            }
++        };
++    }
++
++    private static void sendUsage(final CommandSender sender) {
++        sender.sendMessage(text("Usage:", RED));
++        sender.sendMessage(text("  " + TOP_USAGE, RED));
++        sender.sendMessage(text("  " + INFO_USAGE, RED));
++        sender.sendMessage(text("  " + SET_USAGE, RED));
++    }
++
++    private boolean top(final CommandSender sender, final String[] args) {
++        if (args.length > 2) {
++            sender.sendMessage(text("Usage: " + TOP_USAGE, RED));
++            return false;
++        }
++        int count = DEFAULT_TOP;
++        if (args.length >= 1) {
++            try {
++                count = Math.max(1, Integer.parseInt(args[0]));
++            } catch (final NumberFormatException exception) {
++                sender.sendMessage(text("'" + args[0] + "' is not a number.", RED));
++                return false;
++            }
++        }
++        final List<ServerLevel> levels = new ArrayList<>();
++        if (args.length == 2) {
++            final @Nullable ServerLevel level = level(args[1]);
++            if (level == null) {
++                sender.sendMessage(text("Unknown world.", RED));
++                return false;
++            }
++            levels.add(level);
++        } else {
++            for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                levels.add(level);
++            }
++        }
++        boolean any = false;
++        for (final ServerLevel level : levels) {
++            if (!level.kodamaRedstone.isActive()) {
++                continue;
++            }
++            for (final RedstoneMonitor.ChunkReport report : level.kodamaRedstone.top(count)) {
++                any = true;
++                sender.sendMessage(text("  " + level.getWorld().getName() + " " + report.chunkX() + " " + report.chunkZ() + ": ", WHITE).append(describe(report)));
++            }
++        }
++        if (!any) {
++            sender.sendMessage(text("No redstone activity in the last minute" + (levels.stream().anyMatch(l -> l.kodamaRedstone.isActive()) ? "." : " (redstone monitoring is off)."), GRAY));
++        }
++        return true;
++    }
++
++    private boolean info(final CommandSender sender, final String[] args) {
++        final @Nullable Target target = target(sender, args, INFO_USAGE);
++        if (target == null) {
++            return false;
++        }
++        final RedstoneMonitor.@Nullable ChunkReport report = target.level.kodamaRedstone.report(target.chunkX, target.chunkZ);
++        final String name = target.level.getWorld().getName() + " " + target.chunkX + " " + target.chunkZ + ": ";
++        if (!target.level.kodamaRedstone.isActive()) {
++            sender.sendMessage(text(name, WHITE).append(text("redstone monitoring is off in this world", GRAY)));
++        } else if (report == null) {
++            sender.sendMessage(text(name, WHITE).append(text("no redstone activity in the last minute, "
++                + (target.level.kodamaRedstone.usesAlternateCurrent(target.chunkX, target.chunkZ) ? "Alternate Current" : "world implementation"), GRAY)));
++        } else {
++            sender.sendMessage(text(name, WHITE).append(describe(report)));
++        }
++        return true;
++    }
++
++    private boolean set(final CommandSender sender, final String[] args) {
++        if (args.length == 0) {
++            sender.sendMessage(text("Usage: " + SET_USAGE, RED));
++            return false;
++        }
++        final String mode = args[0].toLowerCase(Locale.ROOT);
++        if (!MODES.contains(mode)) {
++            sender.sendMessage(text("The mode must be alternate-current or vanilla.", RED));
++            return false;
++        }
++        final @Nullable Target target = target(sender, java.util.Arrays.copyOfRange(args, 1, args.length), SET_USAGE);
++        if (target == null) {
++            return false;
++        }
++        if (!target.level.kodamaRedstone.isActive()) {
++            sender.sendMessage(text("Redstone monitoring (redstone.enabled) is off in " + target.level.getWorld().getName() + ".", RED));
++            return false;
++        }
++        if (!target.level.kodamaRedstone.requestSwitch(target.chunkX, target.chunkZ, mode.equals("alternate-current"), sender)) {
++            sender.sendMessage(text("Chunk " + target.chunkX + " " + target.chunkZ + " is not loaded.", RED));
++            return false;
++        }
++        sender.sendMessage(text("Switching chunk " + target.chunkX + " " + target.chunkZ + " once its redstone is quiet.", GREEN));
++        return true;
++    }
++
++    private static net.kyori.adventure.text.Component describe(final RedstoneMonitor.ChunkReport report) {
++        return text(String.format(Locale.ROOT, "%s, %.1f updates/s, active %d of the last %d s, %s", report.kind().displayName(),
++            report.updatesPerSecond(), report.activeSeconds(), 60, report.alternateCurrent() ? "Alternate Current" : "world implementation"), GRAY);
++    }
++
++    private record Target(ServerLevel level, int chunkX, int chunkZ) {
++    }
++
++    private static @Nullable Target target(final CommandSender sender, final String[] args, final String usage) {
++        if (args.length == 0) {
++            if (sender instanceof Player player) {
++                final Location location = player.getLocation();
++                return new Target(((org.bukkit.craftbukkit.CraftWorld) player.getWorld()).getHandle(), location.getBlockX() >> 4, location.getBlockZ() >> 4);
++            }
++            sender.sendMessage(text("The console must give the chunk: " + usage, RED));
++            return null;
++        }
++        if (args.length < 2 || args.length > 3) {
++            sender.sendMessage(text("Usage: " + usage, RED));
++            return null;
++        }
++        final int chunkX;
++        final int chunkZ;
++        try {
++            chunkX = Integer.parseInt(args[0]);
++            chunkZ = Integer.parseInt(args[1]);
++        } catch (final NumberFormatException exception) {
++            sender.sendMessage(text("The chunk coordinates must be whole numbers.", RED));
++            return null;
++        }
++        final @Nullable ServerLevel level = args.length == 3 ? level(args[2])
++            : sender instanceof Player player ? ((org.bukkit.craftbukkit.CraftWorld) player.getWorld()).getHandle() : null;
++        if (level == null) {
++            sender.sendMessage(text("Unknown world. The console must name the world.", RED));
++            return null;
++        }
++        return new Target(level, chunkX, chunkZ);
++    }
++
++    private static @Nullable ServerLevel level(final String name) {
++        return KodamaConfigurations.levelByName(MinecraftServer.getServer(), name);
++    }
++
++    @Override
++    public List<String> tabComplete(final CommandSender sender, final String subCommand, final String[] args) {
++        if (args.length <= 1) {
++            return Completions.matchingLast(args, ACTIONS);
++        }
++        final List<String> worlds = new ArrayList<>();
++        for (final World world : Bukkit.getWorlds()) {
++            worlds.add(world.getName());
++        }
++        return switch (args[0].toLowerCase(Locale.ROOT)) {
++            case "top" -> args.length == 3 ? Completions.matchingLast(args, worlds) : Collections.emptyList();
++            case "info" -> args.length == 4 ? Completions.matchingLast(args, worlds) : Collections.emptyList();
++            case "set" -> args.length == 2 ? Completions.matchingLast(args, MODES) : args.length == 5 ? Completions.matchingLast(args, worlds) : Collections.emptyList();
++            default -> Collections.emptyList();
++        };
++    }
++}
+diff --git a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+index f0ab15a4ce754dc6db83a568d5c3c03fe24c3dbb..dec60428976db7dcd8c6773bb1afc8bfc846cc1a 100644
+--- a/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
++++ b/src/main/java/dev/kodama/command/subcommands/StatusCommand.java
+@@ -51,6 +51,7 @@ public final class StatusCommand extends PermissionedKodamaSubcommand {
+         dev.kodama.chunk.precache.PrecacheStatus.register();
+         dev.kodama.entity.lod.MobLodStatus.register();
+         dev.kodama.network.NetworkStatus.register();
++        dev.kodama.redstone.RedstoneStatus.register();
+     }
+ 
+     public StatusCommand() {
+diff --git a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+index 0e26545eb582401bbd3bbc106b05f5b329df1b9b..97eed5fb0c5d8273448df598cb44f7bd0bf15935 100644
+--- a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+@@ -3,6 +3,7 @@ package dev.kodama.config;
+ import io.papermc.paper.configuration.Configuration;
+ import io.papermc.paper.configuration.ConfigurationPart;
+ import io.papermc.paper.configuration.Configurations;
++import io.papermc.paper.configuration.constraint.Constraints;
+ import net.minecraft.resources.ResourceLocation;
+ import org.spongepowered.configurate.objectmapping.meta.Comment;
+ import org.spongepowered.configurate.objectmapping.meta.Setting;
+@@ -80,12 +81,28 @@ public class KodamaWorldConfiguration extends ConfigurationPart {
+         }
+     }
+ 
+-    @Comment("Redstone optimizations.")
++    @Comment("Redstone monitoring and Alternate Current for single chunks.")
+     public Redstone redstone;
+ 
+     public class Redstone extends ConfigurationPart {
+-        @Comment("Enables the redstone optimizations in this world.")
++        @Comment("Records how often the redstone of every chunk updates, reports chunks that run heavy clocks and lets admins switch single\n"
++            + "chunks to Alternate Current with /kodama redstone. When off, switched chunks use the redstone-implementation of the Paper world config again.")
+         public PresetBoolean enabled = PresetBoolean.of(false, true, true);
++
++        @Comment("Tells admins (permission kodama.redstone.notify) and the console about chunks that keep running a clock above notify-updates-per-second.")
++        public boolean notify = true;
++
++        @Comment("Redstone updates per second (wire, repeater, comparator, observer and piston updates) above which a continuously running chunk is reported.")
++        @Constraints.Min(1)
++        public int notifyUpdatesPerSecond = 300;
++
++        @Comment("Continuously running chunks above this many updates per second are reported as possible lag machines.")
++        @Constraints.Min(1)
++        public int abnormalUpdatesPerSecond = 3000;
++
++        @Comment("Minutes before the same chunk is reported again.")
++        @Constraints.Min(1)
++        public int notifyCooldownMinutes = 30;
+     }
+ 
+     @Comment("Hopper optimizations.")
+diff --git a/src/main/java/dev/kodama/redstone/KodamaRedstone.java b/src/main/java/dev/kodama/redstone/KodamaRedstone.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..93d6ff3204312a2b41a288d31f0d7f431db39f07
+--- /dev/null
++++ b/src/main/java/dev/kodama/redstone/KodamaRedstone.java
+@@ -0,0 +1,41 @@
++package dev.kodama.redstone;
++
++import io.papermc.paper.configuration.WorldConfiguration;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.chunk.LevelChunk;
++
++/**
++ * Entry points of the redstone monitor for the code that was patched into the game.
++ */
++public final class KodamaRedstone {
++
++    private KodamaRedstone() {
++    }
++
++    /**
++     * A redstone component at the position updated: wire, repeater, comparator, observer or piston.
++     */
++    public static void record(final Level world, final BlockPos pos) {
++        if (world instanceof ServerLevel level) {
++            level.kodamaRedstone.record(pos);
++        }
++    }
++
++    /**
++     * Whether the wire at the position is handled by Alternate Current: the world uses it, or the chunk was switched to it.
++     */
++    public static boolean alternateCurrent(final Level world, final BlockPos pos) {
++        return world.paperConfig().misc.redstoneImplementation == WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT
++            || world instanceof ServerLevel level && level.kodamaRedstone.usesAlternateCurrent(pos);
++    }
++
++    public static void onChunkLoad(final LevelChunk chunk) {
++        chunk.level.kodamaRedstone.onChunkLoad(chunk);
++    }
++
++    public static void onChunkUnload(final LevelChunk chunk) {
++        chunk.level.kodamaRedstone.onChunkUnload(chunk);
++    }
++}
+diff --git a/src/main/java/dev/kodama/redstone/RedstoneMonitor.java b/src/main/java/dev/kodama/redstone/RedstoneMonitor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3de6ac4639281a1737b88865fa5f42fe126f24e8
+--- /dev/null
++++ b/src/main/java/dev/kodama/redstone/RedstoneMonitor.java
+@@ -0,0 +1,314 @@
++package dev.kodama.redstone;
++
++import dev.kodama.config.KodamaWorldConfiguration;
++import dev.kodama.feature.FeatureGuard;
++import it.unimi.dsi.fastutil.longs.Long2IntMap;
++import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.objects.ObjectIterator;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Locale;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.chunk.LevelChunk;
++import org.bukkit.Bukkit;
++import org.bukkit.NamespacedKey;
++import org.bukkit.command.CommandSender;
++import org.bukkit.persistence.PersistentDataType;
++import org.checkerframework.checker.nullness.qual.Nullable;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GOLD;
++import static net.kyori.adventure.text.format.NamedTextColor.GREEN;
++import static net.kyori.adventure.text.format.NamedTextColor.RED;
++
++/**
++ * Redstone activity of the chunks of one world, and the chunks that use Alternate Current although the world does not.
++ * <p>
++ * Every redstone update adds one to the count of its chunk for the current tick. Once per second (20 ticks) the counts go
++ * into a 60 second history per chunk: a chunk that updated in at least {@link #CONTINUOUS_SECONDS} of the last 60 seconds
++ * runs a clock (continuous), otherwise its redstone was triggered and settled again (transient). The Alternate Current
++ * choice is stored in the persistent data of the chunk and read when the chunk loads. Main thread only.
++ */
++public final class RedstoneMonitor {
++
++    private static final org.slf4j.Logger LOGGER = com.mojang.logging.LogUtils.getLogger();
++    public static final String FEATURE_ID = "redstone";
++    public static final String NOTIFY_PERMISSION = "kodama.redstone.notify";
++    static final NamespacedKey MODE_KEY = new NamespacedKey("kodama", "redstone");
++    static final String ALTERNATE_CURRENT = "alternate-current";
++
++    static final int WINDOW_SECONDS = 60;
++    static final int CONTINUOUS_SECONDS = 45;
++    private static final long WINDOW_MASK = (1L << WINDOW_SECONDS) - 1L;
++    private static final int SWITCH_TIMEOUT_TICKS = 10 * 20;
++
++    public enum Kind {
++        TRANSIENT, CONTINUOUS, ABNORMAL;
++
++        public String displayName() {
++            return switch (this) {
++                case TRANSIENT -> "transient";
++                case CONTINUOUS -> "continuous (clock)";
++                case ABNORMAL -> "abnormal (possible lag machine)";
++            };
++        }
++    }
++
++    static final class History {
++        final long chunkKey;
++        long activeMask;
++        final int[] perSecond = new int[WINDOW_SECONDS];
++        int cursor;
++        long total;
++        long lastNotifiedTick = Long.MIN_VALUE / 2;
++
++        History(final long chunkKey) {
++            this.chunkKey = chunkKey;
++        }
++
++        int activeSeconds() {
++            return Long.bitCount(this.activeMask);
++        }
++
++        double updatesPerSecond() {
++            return this.total / (double) WINDOW_SECONDS;
++        }
++    }
++
++    public record ChunkReport(int chunkX, int chunkZ, Kind kind, double updatesPerSecond, int activeSeconds, boolean alternateCurrent) {
++    }
++
++    private record PendingSwitch(boolean alternateCurrent, @Nullable CommandSender sender, long requestedTick) {
++    }
++
++    private final ServerLevel level;
++    private boolean active;
++    private final Long2IntOpenHashMap thisTick = new Long2IntOpenHashMap();
++    private final Long2IntOpenHashMap thisSecond = new Long2IntOpenHashMap();
++    private final Long2ObjectOpenHashMap<History> histories = new Long2ObjectOpenHashMap<>();
++    private final LongOpenHashSet alternateCurrentChunks = new LongOpenHashSet();
++    private final Long2ObjectOpenHashMap<PendingSwitch> pending = new Long2ObjectOpenHashMap<>();
++    private int tickInSecond;
++
++    public RedstoneMonitor(final ServerLevel level) {
++        this.level = level;
++    }
++
++    private KodamaWorldConfiguration.@Nullable Redstone section() {
++        final KodamaWorldConfiguration config = this.level.kodamaConfig();
++        return config == null ? null : config.redstone;
++    }
++
++    public boolean isActive() {
++        return this.active;
++    }
++
++    public void record(final BlockPos pos) {
++        if (this.active) {
++            this.thisTick.addTo(ChunkPos.asLong(pos.getX() >> 4, pos.getZ() >> 4), 1);
++        }
++    }
++
++    boolean usesAlternateCurrent(final BlockPos pos) {
++        return this.active && !this.alternateCurrentChunks.isEmpty()
++            && this.alternateCurrentChunks.contains(ChunkPos.asLong(pos.getX() >> 4, pos.getZ() >> 4));
++    }
++
++    public boolean usesAlternateCurrent(final int chunkX, final int chunkZ) {
++        return this.alternateCurrentChunks.contains(ChunkPos.asLong(chunkX, chunkZ));
++    }
++
++    void onChunkLoad(final LevelChunk chunk) {
++        if (ALTERNATE_CURRENT.equals(chunk.persistentDataContainer.get(MODE_KEY, PersistentDataType.STRING))) {
++            this.alternateCurrentChunks.add(chunk.getPos().toLong());
++        }
++    }
++
++    void onChunkUnload(final LevelChunk chunk) {
++        final long key = chunk.getPos().toLong();
++        this.alternateCurrentChunks.remove(key);
++        this.pending.remove(key);
++    }
++
++    /**
++     * Start of the world tick: the counts of the previous tick are complete.
++     */
++    public void tick() {
++        try {
++            final KodamaWorldConfiguration.Redstone section = this.section();
++            final boolean wasActive = this.active;
++            this.active = section != null && section.enabled.isTrue() && !FeatureGuard.isTripped(FEATURE_ID);
++            if (!this.active) {
++                if (wasActive) {
++                    this.thisTick.clear();
++                    this.thisSecond.clear();
++                    this.histories.clear();
++                    this.pending.clear();
++                }
++                return;
++            }
++            if (!this.pending.isEmpty()) {
++                this.applyPendingSwitches();
++            }
++            if (!this.thisTick.isEmpty()) {
++                for (final Long2IntMap.Entry entry : this.thisTick.long2IntEntrySet()) {
++                    this.thisSecond.addTo(entry.getLongKey(), entry.getIntValue());
++                }
++                this.thisTick.clear();
++            }
++            if (++this.tickInSecond >= 20) {
++                this.tickInSecond = 0;
++                this.rollSecond(section);
++            }
++        } catch (final VirtualMachineError error) {
++            throw error;
++        } catch (final Throwable throwable) {
++            FeatureGuard.reportFailure(FEATURE_ID, throwable);
++        }
++    }
++
++    private void rollSecond(final KodamaWorldConfiguration.Redstone section) {
++        final ObjectIterator<Long2ObjectMap.Entry<History>> iterator = this.histories.long2ObjectEntrySet().fastIterator();
++        while (iterator.hasNext()) {
++            final History history = iterator.next().getValue();
++            this.advance(history, this.thisSecond.remove(history.chunkKey));
++            if (history.activeMask == 0L) {
++                iterator.remove();
++            }
++        }
++        for (final Long2IntMap.Entry entry : this.thisSecond.long2IntEntrySet()) {
++            final History history = new History(entry.getLongKey());
++            this.advance(history, entry.getIntValue());
++            this.histories.put(history.chunkKey, history);
++        }
++        this.thisSecond.clear();
++
++        if (section.notify) {
++            final long now = MinecraftServer.currentTickLong;
++            final long cooldown = Math.max(1L, section.notifyCooldownMinutes) * 60L * 20L;
++            for (final History history : this.histories.values()) {
++                final Kind kind = kind(history, section);
++                if (kind != Kind.TRANSIENT && history.updatesPerSecond() >= section.notifyUpdatesPerSecond
++                    && now - history.lastNotifiedTick >= cooldown) {
++                    history.lastNotifiedTick = now;
++                    this.notifyAdmins(history, kind);
++                }
++            }
++        }
++    }
++
++    private void advance(final History history, final int updates) {
++        history.cursor = (history.cursor + 1) % WINDOW_SECONDS;
++        history.total += updates - history.perSecond[history.cursor];
++        history.perSecond[history.cursor] = updates;
++        history.activeMask = ((history.activeMask << 1) | (updates > 0 ? 1L : 0L)) & WINDOW_MASK;
++    }
++
++    static Kind kind(final History history, final KodamaWorldConfiguration.Redstone section) {
++        if (history.activeSeconds() < CONTINUOUS_SECONDS) {
++            return Kind.TRANSIENT;
++        }
++        return history.updatesPerSecond() >= section.abnormalUpdatesPerSecond ? Kind.ABNORMAL : Kind.CONTINUOUS;
++    }
++
++    private void notifyAdmins(final History history, final Kind kind) {
++        final int chunkX = ChunkPos.getX(history.chunkKey);
++        final int chunkZ = ChunkPos.getZ(history.chunkKey);
++        final String where = String.format(Locale.ROOT, "%s chunk %d %d (blocks %d %d)", this.level.getWorld().getName(), chunkX, chunkZ,
++            chunkX << 4, chunkZ << 4);
++        final String rate = String.format(Locale.ROOT, "%.0f redstone updates/s", history.updatesPerSecond());
++        final boolean alternateCurrent = this.usesAlternateCurrent(chunkX, chunkZ);
++        final String hint = alternateCurrent ? "" : " Switch it with /kodama redstone set alternate-current " + chunkX + " " + chunkZ + " " + this.level.getWorld().getName();
++        final String message = (kind == Kind.ABNORMAL ? "Possible lag machine at " : "Redstone clock at ") + where + ": " + rate + "." + hint;
++        LOGGER.warn("[Kodama] {}", message);
++        Bukkit.broadcast(text("[Kodama] " + message, kind == Kind.ABNORMAL ? RED : GOLD), NOTIFY_PERMISSION);
++    }
++
++    /**
++     * Switches a loaded chunk to Alternate Current or back to the world setting at the next tick in which its redstone does
++     * not update (or after a few seconds if it never stops), so no update runs half with one and half with the other
++     * implementation. Returns false when the chunk is not loaded.
++     */
++    public boolean requestSwitch(final int chunkX, final int chunkZ, final boolean alternateCurrent, final @Nullable CommandSender sender) {
++        if (this.level.getChunkIfLoaded(chunkX, chunkZ) == null) {
++            return false;
++        }
++        this.pending.put(ChunkPos.asLong(chunkX, chunkZ), new PendingSwitch(alternateCurrent, sender, MinecraftServer.currentTickLong));
++        return true;
++    }
++
++    private void applyPendingSwitches() {
++        final long now = MinecraftServer.currentTickLong;
++        final ObjectIterator<Long2ObjectMap.Entry<PendingSwitch>> iterator = this.pending.long2ObjectEntrySet().fastIterator();
++        while (iterator.hasNext()) {
++            final Long2ObjectMap.Entry<PendingSwitch> entry = iterator.next();
++            final long key = entry.getLongKey();
++            final PendingSwitch request = entry.getValue();
++            final boolean quiet = !this.thisTick.containsKey(key);
++            if (!quiet && now - request.requestedTick() < SWITCH_TIMEOUT_TICKS) {
++                continue;
++            }
++            iterator.remove();
++            final LevelChunk chunk = this.level.getChunkIfLoaded(ChunkPos.getX(key), ChunkPos.getZ(key));
++            if (chunk == null) {
++                continue;
++            }
++            if (request.alternateCurrent()) {
++                chunk.persistentDataContainer.set(MODE_KEY, PersistentDataType.STRING, ALTERNATE_CURRENT);
++                this.alternateCurrentChunks.add(key);
++            } else {
++                chunk.persistentDataContainer.remove(MODE_KEY);
++                this.alternateCurrentChunks.remove(key);
++            }
++            if (request.sender() != null) {
++                request.sender().sendMessage(text("Chunk " + ChunkPos.getX(key) + " " + ChunkPos.getZ(key) + " in " + this.level.getWorld().getName()
++                    + " now uses " + (request.alternateCurrent() ? "Alternate Current" : "the world's redstone implementation")
++                    + (quiet ? "." : " (its redstone never stopped, switched after " + SWITCH_TIMEOUT_TICKS / 20 + " seconds)."), GREEN));
++            }
++        }
++    }
++
++    public @Nullable ChunkReport report(final int chunkX, final int chunkZ) {
++        final KodamaWorldConfiguration.Redstone section = this.section();
++        final History history = this.histories.get(ChunkPos.asLong(chunkX, chunkZ));
++        if (section == null || history == null) {
++            return null;
++        }
++        return new ChunkReport(chunkX, chunkZ, kind(history, section), history.updatesPerSecond(), history.activeSeconds(),
++            this.usesAlternateCurrent(chunkX, chunkZ));
++    }
++
++    /**
++     * Chunks with the most redstone updates in the last minute, most first.
++     */
++    public List<ChunkReport> top(final int limit) {
++        final List<ChunkReport> reports = new ArrayList<>();
++        for (final History history : this.histories.values()) {
++            final ChunkReport report = this.report(ChunkPos.getX(history.chunkKey), ChunkPos.getZ(history.chunkKey));
++            if (report != null) {
++                reports.add(report);
++            }
++        }
++        reports.sort(Comparator.comparingDouble(ChunkReport::updatesPerSecond).reversed());
++        return reports.size() > limit ? reports.subList(0, limit) : reports;
++    }
++
++    public int[] countKinds() {
++        final int[] counts = new int[Kind.values().length + 1];
++        final KodamaWorldConfiguration.Redstone section = this.section();
++        if (section != null) {
++            for (final History history : this.histories.values()) {
++                counts[kind(history, section).ordinal()]++;
++            }
++        }
++        counts[Kind.values().length] = this.alternateCurrentChunks.size();
++        return counts;
++    }
++}
+diff --git a/src/main/java/dev/kodama/redstone/RedstoneStatus.java b/src/main/java/dev/kodama/redstone/RedstoneStatus.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ad051f1dcefee08dacbd3fa35778ae23b5704ea
+--- /dev/null
++++ b/src/main/java/dev/kodama/redstone/RedstoneStatus.java
+@@ -0,0 +1,47 @@
++package dev.kodama.redstone;
++
++import dev.kodama.command.StatusContributor;
++import dev.kodama.command.subcommands.StatusCommand;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.TextComponent;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++
++import static net.kyori.adventure.text.Component.text;
++import static net.kyori.adventure.text.format.NamedTextColor.GRAY;
++import static net.kyori.adventure.text.format.NamedTextColor.WHITE;
++
++/**
++ * The {@code Redstone} line of {@code /kodama status}.
++ */
++public final class RedstoneStatus {
++
++    private RedstoneStatus() {
++    }
++
++    public static void register() {
++        StatusCommand.register(new StatusContributor() {
++            @Override
++            public String label() {
++                return "Redstone";
++            }
++
++            @Override
++            public Component describe() {
++                TextComponent result = text("");
++                for (final ServerLevel level : MinecraftServer.getServer().getAllLevels()) {
++                    result = result.append(text("\n  " + level.getWorld().getName() + ": ", WHITE));
++                    if (!level.kodamaRedstone.isActive()) {
++                        result = result.append(text("off", GRAY));
++                        continue;
++                    }
++                    final int[] counts = level.kodamaRedstone.countKinds();
++                    result = result.append(text("active chunks: " + counts[RedstoneMonitor.Kind.TRANSIENT.ordinal()] + " transient, "
++                        + counts[RedstoneMonitor.Kind.CONTINUOUS.ordinal()] + " continuous, " + counts[RedstoneMonitor.Kind.ABNORMAL.ordinal()]
++                        + " abnormal; loaded Alternate Current chunks: " + counts[RedstoneMonitor.Kind.values().length], GRAY));
++                }
++                return result;
++            }
++        });
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index a82136433f6f1dda030b0ce692f27f7e00fd6305..45b302646ee2a736e11716d24909caefc76f1ee8 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -522,6 +522,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+     public final io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader playerChunkLoader = new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader(this);
+     public final dev.kodama.entity.lod.MobLodManager kodamaMobLod = new dev.kodama.entity.lod.MobLodManager(this); // Kodama - mob-lod
++    public final dev.kodama.redstone.RedstoneMonitor kodamaRedstone = new dev.kodama.redstone.RedstoneMonitor(this); // Kodama - redstone
+     private final java.util.concurrent.atomic.AtomicReference<io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances> viewDistances = new java.util.concurrent.atomic.AtomicReference<>(new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances(-1, -1, -1));
+ 
+     public io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances getViewDistances() {
+@@ -813,6 +814,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         ProfilerFiller gameprofilerfiller = this.getProfiler();
+ 
+         this.handlingTick = true;
++        this.kodamaRedstone.tick(); // Kodama - redstone
+         TickRateManager tickratemanager = this.tickRateManager();
+         boolean flag = tickratemanager.runsNormally();
+ 
+diff --git a/src/main/java/net/minecraft/world/level/block/DiodeBlock.java b/src/main/java/net/minecraft/world/level/block/DiodeBlock.java
+index b9f605db2b0de1c18c615f0f6485da7eaaf09b65..aa7cc09ce2d80a841e50bc3451455c0c010e1792 100644
+--- a/src/main/java/net/minecraft/world/level/block/DiodeBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/DiodeBlock.java
+@@ -52,6 +52,7 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+ 
+     @Override
+     protected void tick(BlockState state, ServerLevel world, BlockPos pos, RandomSource random) {
++        world.kodamaRedstone.record(pos); // Kodama - redstone
+         if (!this.isLocked(world, pos, state)) {
+             boolean flag = (Boolean) state.getValue(DiodeBlock.POWERED);
+             boolean flag1 = this.shouldTurnOn(world, pos, state);
+diff --git a/src/main/java/net/minecraft/world/level/block/ObserverBlock.java b/src/main/java/net/minecraft/world/level/block/ObserverBlock.java
+index b38fbe5121f293f425d7673a6ce49b11d0ced0d9..057e221a73497d5dca44d3a1f7797c7c0dc13a62 100644
+--- a/src/main/java/net/minecraft/world/level/block/ObserverBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/ObserverBlock.java
+@@ -48,6 +48,7 @@ public class ObserverBlock extends DirectionalBlock {
+ 
+     @Override
+     protected void tick(BlockState state, ServerLevel world, BlockPos pos, RandomSource random) {
++        world.kodamaRedstone.record(pos); // Kodama - redstone
+         if ((Boolean) state.getValue(ObserverBlock.POWERED)) {
+             // CraftBukkit start
+             if (CraftEventFactory.callRedstoneChange(world, pos, 15, 0).getNewCurrent() != 0) {
+diff --git a/src/main/java/net/minecraft/world/level/block/RedStoneWireBlock.java b/src/main/java/net/minecraft/world/level/block/RedStoneWireBlock.java
+index c131734cad123a35456d18f8a161f77a4ac9ac99..44dda0af9265a9fa530f89abf25a23a4536162e1 100644
+--- a/src/main/java/net/minecraft/world/level/block/RedStoneWireBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/RedStoneWireBlock.java
+@@ -461,7 +461,7 @@ public class RedStoneWireBlock extends Block {
+     protected void onPlace(BlockState state, Level world, BlockPos pos, BlockState oldState, boolean notify) {
+         if (!oldState.is(state.getBlock()) && !world.isClientSide) {
+             // Paper start - optimize redstone - replace call to updatePowerStrength
+-            if (world.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT) {
++            if (dev.kodama.redstone.KodamaRedstone.alternateCurrent(world, pos)) { // Kodama - redstone
+                 world.getWireHandler().onWireAdded(pos); // Alternate Current
+             } else {
+                 this.updateSurroundingRedstone(world, pos, state, null); // vanilla/Eigencraft
+@@ -494,7 +494,7 @@ public class RedStoneWireBlock extends Block {
+                 }
+ 
+                 // Paper start - optimize redstone - replace call to updatePowerStrength
+-                if (world.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT) {
++                if (dev.kodama.redstone.KodamaRedstone.alternateCurrent(world, pos)) { // Kodama - redstone
+                     world.getWireHandler().onWireRemoved(pos, state); // Alternate Current
+                 } else {
+                     this.updateSurroundingRedstone(world, pos, state, null); // vanilla/Eigencraft
+@@ -533,9 +533,10 @@ public class RedStoneWireBlock extends Block {
+     @Override
+     protected void neighborChanged(BlockState state, Level world, BlockPos pos, Block sourceBlock, BlockPos sourcePos, boolean notify) {
+         if (!world.isClientSide) {
++            dev.kodama.redstone.KodamaRedstone.record(world, pos); // Kodama - redstone
+             // Paper start - optimize redstone (Alternate Current)
+             // Alternate Current handles breaking of redstone wires in the WireHandler.
+-            if (world.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT) {
++            if (dev.kodama.redstone.KodamaRedstone.alternateCurrent(world, pos)) { // Kodama - redstone
+                 world.getWireHandler().onWireUpdated(pos);
+             } else
+             // Paper end - optimize redstone (Alternate Current)
+diff --git a/src/main/java/net/minecraft/world/level/block/piston/PistonBaseBlock.java b/src/main/java/net/minecraft/world/level/block/piston/PistonBaseBlock.java
+index e0c62227b279a5fe0f3868fbf9ce8c78c515a09c..eaf36afa5b62fda6f9b1983b8fbd1307a2b1147c 100644
+--- a/src/main/java/net/minecraft/world/level/block/piston/PistonBaseBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/piston/PistonBaseBlock.java
+@@ -212,6 +212,7 @@ public class PistonBaseBlock extends DirectionalBlock {
+ 
+     @Override
+     protected boolean triggerEvent(BlockState state, Level world, BlockPos pos, int type, int data) {
++        dev.kodama.redstone.KodamaRedstone.record(world, pos); // Kodama - redstone
+         Direction enumdirection = (Direction) state.getValue(PistonBaseBlock.FACING);
+         // Paper start - Protect Bedrock and End Portal/Frames from being destroyed; prevent retracting when we're facing the wrong way (we were replaced before retraction could occur)
+         Direction directionQueuedAs = Direction.from3DDataValue(data & 7); // Paper - copied from below
+diff --git a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+index fae6b0290b8b70f52770cf0f579928e3477175bf..ec025e95db3f45a7971dd64c917c61414852fbb9 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/src/main/java/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -799,6 +799,7 @@ public class LevelChunk extends ChunkAccess {
+         if (this.loadedTicketLevel) { LOGGER.error("Double calling chunk load!", new Throwable()); } // Paper
+         // Paper - rewrite chunk system - move into separate callback
+         this.loadedTicketLevel = true;
++        dev.kodama.redstone.KodamaRedstone.onChunkLoad(this); // Kodama - redstone
+         // Paper - rewrite chunk system - move into separate callback
+         org.bukkit.Server server = this.level.getCraftServer();
+         // Paper - rewrite chunk system - move into separate callback
+@@ -844,6 +845,7 @@ public class LevelChunk extends ChunkAccess {
+ 
+     public void unloadCallback() {
+         if (!this.loadedTicketLevel) { LOGGER.error("Double calling chunk unload!", new Throwable()); } // Paper
++        dev.kodama.redstone.KodamaRedstone.onChunkUnload(this); // Kodama - redstone
+         org.bukkit.Server server = this.level.getCraftServer();
+         this.chunkHolder.getEntityChunk().callEntitiesUnloadEvent(); // Paper - rewrite chunk system
+         org.bukkit.Chunk bukkitChunk = new org.bukkit.craftbukkit.CraftChunk(this);
