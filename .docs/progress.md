@@ -1,6 +1,6 @@
 # Kodama 進捗記録
 
-設計書 `design.md` の各項目の実装状況と、次にやること。最終更新: 2026-10-18。
+設計書 `design.md` の各項目の実装状況と、次にやること。最終更新: 2026-10-23。
 
 ## 状況一覧
 
@@ -9,7 +9,7 @@
 | §9-1 | Paper フォーク環境 | 完了。Paper 1.20.6 build 151 (`a4f0f5cc`)、paperweight 1.7.1 | `patches/server/0001` |
 | §7 | ベンチ基盤 | 完了。Paper と Kodama の比較、ボット (settler/explorer/mixed/afk)、遅い tick のスタック採取、設定上書き、週次 CI | `testing/` |
 | §8 | チャンク生成一致 | 完了。決定的生成で Paper と完全一致を確認 (2 シード、半径 8) | `testing/vanilla-diff/` |
-| §8 | トラップタワー | テスト環境のみ完了 (空ワールド、開いたトラップドア)。Paper と Kodama の比較は未実施 | `testing/harness-plugin/.../TrapTower.java` |
+| §8 | トラップタワー | 完了。10 分で Paper 30 体 / Kodama 32 体、MSPT 同等 | `testing/harness-plugin/.../TrapTower.java` |
 | §8 | プラグイン互換スモーク | 未着手 | |
 | §6.1-6.3, 6.5 | 設定・プリセット・ホットリロード・安全装置 | 完了 | `0002` |
 | §6.4 | `/kodama` コマンド | 完了 (GUI は未着手) | `0003` |
@@ -20,7 +20,8 @@
 | §2.3 | 送信パケットキャッシュ | 完了 (パケットオブジェクト共有方式) | `0018` |
 | §2.2 | ticking 昇格の分散 (スパイク対策、設計外) | 完了 | `0019`, `0023` |
 | §2.4 | 生成の SIMD 化・生成スレッド動的制御 | 未着手 | |
-| §1 | Mob LOD 第1段階 (ティア判定・除外・保護・中距離 AI 間引き・API で即昇格) | 実装済み、性能は Paper と同等止まり | `0020`, `0021` |
+| §1 | Mob LOD 第1段階 (ティア判定・除外・保護・中距離 AI 間引き・API で即昇格) | 実装済み。トラップタワーは壊さないが、settler では無効にしても MSPT が変わらない | `0020`, `0021` |
+| 設計外 | チャンク座標キーのハッシュ衝突修正、Kodama チケットの期限を自前管理 | 完了 | `0024`, `0025` |
 | §1 | Mob LOD 第2段階 (遠距離座標シミュレーション・SoA・デスポーン換算・復元分散・追跡範囲拡大) | 未着手 | |
 | §4 | ネットワーク (動的圧縮・帯域枠分け) | 未着手 (無駄な移動パケット削減は Gale パッチで導入済み) | |
 | §3 | 赤石 (装置分類・チャンク単位 Alternate Current) | 未着手。Paper 1.20.6 に Alternate Current 実装あり | |
@@ -36,15 +37,21 @@
 - 事前生成をプレイヤーがいる間に動かすと MSPT が悪化する (同時 2 件でも p99 が大きく悪化) ため、既定は 0 (オンライン中は停止)
 - Mob LOD の中距離を Paper の EAR 範囲 (32) の外に置くと Paper より遅くなる。既定は near 16 / far 32 にした
 - ticking 昇格を 1 tick あたり 4 チャンクに分散すると、50ms 超えの tick が無くなる。代わりに p99 は 20ms 前後になる (Paper は 10ms 前後だが、まとめてスパイクを出す)
+- settler 8 体を 3 周 (平均): Paper 3.95 / Kodama 3.99 ms。p99 の悪化 (12.9 → 15.7) は chunk-loading が原因で、代わりに max が 72 → 40 ms、50ms 超えが 0 になる。mob-lod、async、safe プリセットはどれも平均に差が出ない
+- mixed 20 体で JFR を取ると、メインスレッドの内訳はエンティティ 15% (うち Mob AI 3%)、新規チャンクの `postProcessGeneration` で走る流体 tick 18%、`NaturalSpawner` 12〜16%、チケットの期限切れ処理 3〜8%
+- Paper の `ChunkCoordinate` など 4 クラスの `hashCode` は `(int) HashCommon.mix(key)` で、`ConcurrentHashMap` の spread と打ち消し合い、バケットが chunkX だけで決まっていた (3600 チャンクで 8192 中 60 バケット)。`0024` で解消
+- Paper のチケット期限は毎 tick 全件を減算する。Kodama の先読み・unload 遅延チケットで 3% → 8% に増えていたため、`0025` で期限なしチケット＋自前の期限管理 (1 秒ごと) にした
+- 上の 2 本の後、mixed 20 体 3 周で Paper 比 MSPT 平均 -11〜-23%、p99 -28〜-43%、50ms 超えの tick -70%
 
 ## 次にやること (順番)
 
-1. Mob LOD 第1段階の計測: settler で Paper と同等か複数回確認、トラップタワーで Paper と Kodama を 10 分ずつ比較 (`bench --pattern afk --bots 1 --tower --duration 600`)
-2. Mob LOD 第2段階 (§1.1 遠距離、§1.2、§1.6)
-3. ネットワーク §4、赤石・ホッパー §3
-4. Leaf の残り候補: 0041 Multithreaded Tracker と 0083/0084 (ProtocolLib 互換リスクあり、既定は aggressive のみを想定)
-5. §8 プラグイン互換スモーク (EssentialsX, WorldEdit, LuckPerms, ProtocolLib, MythicMobs)
-6. 設定 GUI (§6.4)、起動スクリプト (§5)
+1. 新規チャンクの流体後処理 (`LevelChunk.postProcessGeneration` → `FlowingFluid.tick`、生成が多い場面でメインスレッドの 18%)。バニラ一致を保てる高速化か、tick あたりの処理量の分散を検討
+2. `NaturalSpawner` (12〜24%)。ほぼランダム位置のブロック参照とハイトマップ参照のキャッシュミス
+3. Mob LOD 第2段階 (§1.1 遠距離、§1.2、§1.6)。Mob AI はメインスレッドの 3〜5% しかないので効果は小さい見込み
+4. ネットワーク §4、赤石・ホッパー §3
+5. Leaf の残り候補: 0041 Multithreaded Tracker と 0083/0084 (ProtocolLib 互換リスクあり、既定は aggressive のみを想定)
+6. §8 プラグイン互換スモーク (EssentialsX, WorldEdit, LuckPerms, ProtocolLib, MythicMobs)
+7. 設定 GUI (§6.4)、起動スクリプト (§5)
 
 ## 設計から外した判断
 
