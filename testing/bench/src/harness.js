@@ -17,7 +17,9 @@ function commonServerOptions(flavor, dir, env, jar, jarHarness) {
 export async function runPregen({ flavor, dir, seed, radius, worlds, env, label, deterministic = false }) {
   const jar = await resolveJar(flavor);
   const harness = await harnessJar();
-  prepareServerDir(dir, { ...commonServerOptions(flavor, dir, env, jar, harness), seed, deterministic });
+  // Kodama pre-generates around spawn while nobody is online, in its own order, which changes the features like parallel generation does
+  const kodamaSettings = ['precache.enabled=false'];
+  prepareServerDir(dir, { ...commonServerOptions(flavor, dir, env, jar, harness), seed, deterministic, kodamaSettings });
   const out = join(dir, 'harness-out');
   mkdirSync(out, { recursive: true });
   const worldNames = worlds?.length ? worlds : Object.values(WORLD_NAMES);
