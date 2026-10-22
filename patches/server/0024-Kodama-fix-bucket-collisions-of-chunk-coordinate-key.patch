@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Thu, 22 Oct 2026 23:52:31 +0900
+Subject: [PATCH] Kodama: fix bucket collisions of chunk coordinate keys
+
+License: GPL-3.0
+
+The coordinate keys of ConcurrentHashMap returned (int) HashCommon.mix(key).
+The low bits of that value xor its next 16 bits, and the spread of
+ConcurrentHashMap xors them again, so the bucket index only depended on
+chunkX: 3600 chunks around the origin used 60 of 8192 buckets, each a tree
+bin of 60 entries. Folding the high half in spreads them over 2956 buckets.
+ChunkHolderManager ticket lookups were 3-9% of the main thread with 20 bots.
+
+diff --git a/src/main/java/ca/spottedleaf/concurrentutil/lock/ReentrantAreaLock.java b/src/main/java/ca/spottedleaf/concurrentutil/lock/ReentrantAreaLock.java
+index 4fd9a0cd8f1e6ae1a97e963dc7731a80bc6fac5b..ff09f54c85266104bce4bc52186ee1d25f11b05f 100644
+--- a/src/main/java/ca/spottedleaf/concurrentutil/lock/ReentrantAreaLock.java
++++ b/src/main/java/ca/spottedleaf/concurrentutil/lock/ReentrantAreaLock.java
+@@ -364,7 +364,7 @@ public final class ReentrantAreaLock {
+ 
+         @Override
+         public int hashCode() {
+-            return (int)HashCommon.mix(this.key);
++            return HashCommon.long2int(HashCommon.mix(this.key)); // Kodama - with a plain (int) cast the spread of ConcurrentHashMap cancels the mix and buckets only by chunkX
+         }
+ 
+         @Override
+diff --git a/src/main/java/io/papermc/paper/chunk/system/io/RegionFileIOThread.java b/src/main/java/io/papermc/paper/chunk/system/io/RegionFileIOThread.java
+index 2096e57c025858519e7c46788993b9aac1ec60e8..7489ed7cac627339cd39d31ca9f3907757de7952 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/io/RegionFileIOThread.java
++++ b/src/main/java/io/papermc/paper/chunk/system/io/RegionFileIOThread.java
+@@ -1021,7 +1021,7 @@ public final class RegionFileIOThread extends PrioritisedQueueExecutorThread {
+ 
+         @Override
+         public int hashCode() {
+-            return (int)HashCommon.mix(this.key);
++            return HashCommon.long2int(HashCommon.mix(this.key)); // Kodama - with a plain (int) cast the spread of ConcurrentHashMap cancels the mix and buckets only by chunkX
+         }
+ 
+         @Override
+diff --git a/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkQueue.java b/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkQueue.java
+index 4cc1b3ba6d093a9683dbd8b7fe76106ae391e019..5cb5c11ea42505cf33d50472b6bd81f944f51c38 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkQueue.java
++++ b/src/main/java/io/papermc/paper/chunk/system/scheduling/ChunkQueue.java
+@@ -134,7 +134,7 @@ public final class ChunkQueue {
+ 
+         @Override
+         public int hashCode() {
+-            return (int)HashCommon.mix(this.key);
++            return HashCommon.long2int(HashCommon.mix(this.key)); // Kodama - with a plain (int) cast the spread of ConcurrentHashMap cancels the mix and buckets only by chunkX
+         }
+ 
+         @Override
+diff --git a/src/main/java/io/papermc/paper/chunk/system/scheduling/ThreadedTicketLevelPropagator.java b/src/main/java/io/papermc/paper/chunk/system/scheduling/ThreadedTicketLevelPropagator.java
+index 287240ed3b440f2f5733c368416e4276f626405d..c7cd286b0cd29d9895f75f2bc6b20fcf6f411d07 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/scheduling/ThreadedTicketLevelPropagator.java
++++ b/src/main/java/io/papermc/paper/chunk/system/scheduling/ThreadedTicketLevelPropagator.java
+@@ -1290,7 +1290,7 @@ public abstract class ThreadedTicketLevelPropagator {
+ 
+         @Override
+         public int hashCode() {
+-            return (int)HashCommon.mix(this.key);
++            return HashCommon.long2int(HashCommon.mix(this.key)); // Kodama - with a plain (int) cast the spread of ConcurrentHashMap cancels the mix and buckets only by chunkX
+         }
+ 
+         @Override

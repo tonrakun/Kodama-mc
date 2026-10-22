@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 00:01:09 +0900
+Subject: [PATCH] Kodama: expire prefetch and unload delay tickets without a
+ lifespan
+
+License: GPL-3.0
+
+ChunkHolderManager counts down the remaining ticks of every ticket that has a
+lifespan, in every tick. The unload delay and prefetch tickets (up to 1024
+chunks per world, 20-30 seconds each) made that loop 8% of the main thread
+with 20 mixed bots, against 3% in Paper. The tickets now have no lifespan and
+KodamaChunkTickets removes them from its own expiry maps once per second.
+
+diff --git a/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java b/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java
+index c3e38fd981c4cfdb142f6f585082c9d6e9ce7eb0..c1f3bd4f18d34d0488ff40a671f1f486cea2ebaa 100644
+--- a/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java
++++ b/src/main/java/dev/kodama/chunk/ChunkPrefetcher.java
+@@ -266,8 +266,6 @@ public final class ChunkPrefetcher {
+         final ChunkHolderManager holderManager = world.chunkTaskScheduler.chunkHolderManager;
+         final long now = MinecraftServer.currentTickLong;
+ 
+-        // the ticket manager reads the lifespan when it creates the ticket
+-        KodamaChunkTickets.PREFETCH.timeout = ticketTicks;
+         for (int i = 0; i < count; i++) {
+             final long chunk = chunks[i];
+             tickets.trackPrefetch(chunk, now, ticketTicks);
+diff --git a/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java b/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java
+index 9ad32f1ce5ecddff2f03887ba25b5431941156f5..a12d5ebe65b81d1d94c7cfeacd272b66aafa8cb8 100644
+--- a/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java
++++ b/src/main/java/dev/kodama/chunk/KodamaChunkTickets.java
+@@ -3,32 +3,36 @@ package dev.kodama.chunk;
+ import ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor;
+ import io.papermc.paper.util.CoordinateUtils;
+ import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
++import io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader;
++import io.papermc.paper.chunk.system.scheduling.ChunkHolderManager;
++import it.unimi.dsi.fastutil.longs.LongArrayList;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.level.TicketType;
+ 
+ /**
+- * The Kodama chunk tickets of one world and the bookkeeping that bounds them. The chunk system expires the tickets
+- * itself (the ticket types have a lifespan); the maps here mirror the expiry tick so that Kodama can count the live
+- * tickets without asking the chunk system. Main thread only.
++ * The Kodama chunk tickets of one world and their expiry. The tickets have no lifespan in the chunk system, which
++ * would count down every timed ticket in every tick; they are removed here when the expiry tick in the maps has passed,
++ * checked once per second. Main thread only.
+  */
+ public final class KodamaChunkTickets {
+ 
+     /**
+      * Keeps a chunk that left a player's view range loaded (full, not ticking) for a while. The lifespan is set from the
+-     * configuration whenever a ticket is created.
++     * configuration in {@link #trackUnloadDelay}.
+      */
+-    public static final TicketType<Long> UNLOAD_DELAY = TicketType.create("kodama_unload_delay", Long::compareTo, 600);
++    public static final TicketType<Long> UNLOAD_DELAY = TicketType.create("kodama_unload_delay", Long::compareTo);
+ 
+     /**
+      * Generates a chunk ahead of a moving player (full, not ticking). The lifespan is set from the configuration
+-     * whenever a ticket is created.
++     * in {@link #trackPrefetch}.
+      */
+-    public static final TicketType<Long> PREFETCH = TicketType.create("kodama_prefetch", Long::compareTo, 400);
++    public static final TicketType<Long> PREFETCH = TicketType.create("kodama_prefetch", Long::compareTo);
+ 
+     private static final int SWEEP_INTERVAL_TICKS = 20;
+ 
+     private final Long2LongOpenHashMap unloadDelayExpiry = new Long2LongOpenHashMap(); // chunk key -> expiry tick
+     private final Long2LongOpenHashMap prefetchExpiry = new Long2LongOpenHashMap();
++    private final LongArrayList expired = new LongArrayList();
+     private long lastSweep;
+ 
+     public KodamaChunkTickets() {
+@@ -37,23 +41,42 @@ public final class KodamaChunkTickets {
+     }
+ 
+     /**
+-     * Called once per tick of the world; drops the entries whose tickets have expired.
++     * Called once per tick of the world; removes the tickets that have expired.
+      */
+-    public void tick(final long now) {
++    public void tick(final ServerLevel world, final long now) {
+         if (now - this.lastSweep < SWEEP_INTERVAL_TICKS) {
+             return;
+         }
+         this.lastSweep = now;
+         if (!this.unloadDelayExpiry.isEmpty()) {
+-            sweep(this.unloadDelayExpiry, now);
++            this.sweep(world, this.unloadDelayExpiry, UNLOAD_DELAY, now);
+         }
+         if (!this.prefetchExpiry.isEmpty()) {
+-            sweep(this.prefetchExpiry, now);
++            this.sweep(world, this.prefetchExpiry, PREFETCH, now);
+         }
+     }
+ 
+-    private static void sweep(final Long2LongOpenHashMap map, final long now) {
+-        map.long2LongEntrySet().removeIf(entry -> entry.getLongValue() <= now);
++    private void sweep(final ServerLevel world, final Long2LongOpenHashMap map, final TicketType<Long> type, final long now) {
++        final LongArrayList expired = this.expired;
++        map.long2LongEntrySet().removeIf(entry -> {
++            if (entry.getLongValue() > now) {
++                return false;
++            }
++            expired.add(entry.getLongKey());
++            return true;
++        });
++        if (expired.isEmpty()) {
++            return;
++        }
++        final ChunkHolderManager holderManager = world.chunkTaskScheduler.chunkHolderManager;
++        try {
++            for (int i = 0; i < expired.size(); i++) {
++                final long chunk = expired.getLong(i);
++                holderManager.removeTicketAtLevel(type, chunk, RegionizedPlayerChunkLoader.GENERATED_TICKET_LEVEL, Long.valueOf(chunk));
++            }
++        } finally {
++            expired.clear();
++        }
+     }
+ 
+     public int unloadDelayCount() {
+@@ -69,9 +92,9 @@ public final class KodamaChunkTickets {
+      *
+      * @return whether the ticket may be added
+      */
+-    boolean trackUnloadDelay(final long chunk, final long now, final long lifespanTicks, final int maxChunks) {
++    boolean trackUnloadDelay(final ServerLevel world, final long chunk, final long now, final long lifespanTicks, final int maxChunks) {
+         if (this.unloadDelayExpiry.size() >= maxChunks && !this.unloadDelayExpiry.containsKey(chunk)) {
+-            sweep(this.unloadDelayExpiry, now);
++            this.sweep(world, this.unloadDelayExpiry, UNLOAD_DELAY, now);
+             if (this.unloadDelayExpiry.size() >= maxChunks) {
+                 return false;
+             }
+diff --git a/src/main/java/dev/kodama/chunk/UnloadDelay.java b/src/main/java/dev/kodama/chunk/UnloadDelay.java
+index 0c8c611fe7720cab8b18517a18a56d9e36bca455..ad3320258235ad4663ab23ad899c8e5d3f8c7baa 100644
+--- a/src/main/java/dev/kodama/chunk/UnloadDelay.java
++++ b/src/main/java/dev/kodama/chunk/UnloadDelay.java
+@@ -41,12 +41,9 @@ public final class UnloadDelay {
+                 return null;
+             }
+             final KodamaChunkTickets tickets = world.playerChunkLoader.kodamaTickets;
+-            if (!tickets.trackUnloadDelay(chunk, MinecraftServer.currentTickLong, lifespan, ChunkLoadingSettings.unloadDelayMaxChunks())) {
++            if (!tickets.trackUnloadDelay(world, chunk, MinecraftServer.currentTickLong, lifespan, ChunkLoadingSettings.unloadDelayMaxChunks())) {
+                 return null;
+             }
+-            // the ticket manager reads the lifespan when it creates the ticket, which happens when this player's delayed ticket
+-            // operations are flushed, before the chunk loader of the next player (and its lifespan) runs
+-            KodamaChunkTickets.UNLOAD_DELAY.timeout = lifespan;
+             return ChunkHolderManager.TicketOperation.addOp(
+                 chunk, KodamaChunkTickets.UNLOAD_DELAY, RegionizedPlayerChunkLoader.GENERATED_TICKET_LEVEL, Long.valueOf(chunk)
+             );
+diff --git a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+index 474c6a55ac92086892f04dc3464f589326bbcdc5..09654e347faaf38e24d35459bd1e898fc0232ccf 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
++++ b/src/main/java/io/papermc/paper/chunk/system/RegionizedPlayerChunkLoader.java
+@@ -314,7 +314,7 @@ public class RegionizedPlayerChunkLoader {
+     public void tick() {
+         TickThread.ensureTickThread("Cannot tick player chunk loader async");
+         long currTime = System.nanoTime();
+-        this.kodamaTickets.tick(net.minecraft.server.MinecraftServer.currentTickLong); // Kodama - chunk-prefetch, chunk-unload-delay
++        this.kodamaTickets.tick(this.world, net.minecraft.server.MinecraftServer.currentTickLong); // Kodama - chunk-prefetch, chunk-unload-delay
+         for (final ServerPlayer player : new java.util.ArrayList<>(this.world.players())) {
+             final PlayerChunkLoaderData loader = player.chunkLoader;
+             if (loader == null || loader.world != this.world) {
