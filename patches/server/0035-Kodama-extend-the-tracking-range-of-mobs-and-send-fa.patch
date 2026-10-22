@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 08:24:08 +0900
+Subject: [PATCH] Kodama: extend the tracking range of mobs and send far mobs
+ less often
+
+
+diff --git a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+index 703378e68aea497644630ced353b3beae307f8af..940fcd1e301aff2d358647d3a9cd27ea876f5f46 100644
+--- a/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
++++ b/src/main/java/dev/kodama/config/KodamaWorldConfiguration.java
+@@ -68,6 +68,16 @@ public class KodamaWorldConfiguration extends ConfigurationPart {
+         @Comment("Seconds a mob stays NEAR after a plugin used AI related API on it.")
+         public int apiPinSeconds = 30;
+ 
++        @RestartRequired
++        @Comment("Monsters and animals are visible to players up to this many blocks (at most the view distance) when it is larger than\n"
++            + "entity-tracking-range in spigot.yml, so distant mobs do not pop in. 0 keeps the spigot.yml ranges. Needs mob-lod.enabled.\n"
++            + "Costs bandwidth: 80 used about 20-40% more per player than 48 with 20 players in the Kodama benchmark.")
++        public PresetInt trackingRange = PresetInt.of(0, 0, 0);
++
++        @Comment("FAR mobs send their position and data to players only every this many times as often as vanilla (1 = like vanilla).\n"
++            + "Movement caused by knockback and changed entity data are still sent at once.")
++        public PresetInt farUpdateIntervalMultiplier = PresetInt.of(1, 4, 6);
++
+         @Comment("Areas where mobs are always NEAR, each a cylinder over the full height: {name, x, z, radius}. Manage them with /kodama lod exclude.")
+         public java.util.List<ExcludedArea> excludedAreas = new java.util.ArrayList<>();
+ 
+diff --git a/src/main/java/dev/kodama/entity/lod/MobLod.java b/src/main/java/dev/kodama/entity/lod/MobLod.java
+index 81d7da7a8e98a782722044b4e49cabe3e3b95ca9..f8d9291ffb95994b47259776073a3eb8a784a38f 100644
+--- a/src/main/java/dev/kodama/entity/lod/MobLod.java
++++ b/src/main/java/dev/kodama/entity/lod/MobLod.java
+@@ -34,6 +34,28 @@ public final class MobLod {
+         return mob.kodamaTier == MobTier.FAR;
+     }
+ 
++    /**
++     * The tracking range for monsters and animals that replaces a smaller spigot.yml range, or 0.
++     */
++    public static int extendedTrackingRange(final net.minecraft.world.level.Level level) {
++        final dev.kodama.config.KodamaWorldConfiguration config = level.kodamaConfig();
++        if (config == null || config.mobLod == null || !config.mobLod.enabled.isTrue() || FeatureGuard.isTripped(FEATURE_ID)) {
++            return 0;
++        }
++        return Math.max(0, config.mobLod.trackingRange.getAsInt());
++    }
++
++    /**
++     * How many ticks lie between two updates the tracker sends for the mob.
++     */
++    public static int updateInterval(final Mob mob, final int vanillaInterval) {
++        if (mob.kodamaTier != MobTier.FAR) {
++            return vanillaInterval;
++        }
++        final dev.kodama.config.KodamaWorldConfiguration config = mob.level().kodamaConfig();
++        return config == null || config.mobLod == null ? vanillaInterval : vanillaInterval * Math.max(1, config.mobLod.farUpdateIntervalMultiplier.getAsInt());
++    }
++
+     /**
+      * Plugin API that touches the AI of a mob (target, pathfinder, goals, awareness, look direction, leash): the mob is
+      * NEAR before the call returns and stays NEAR for {@code api-pin-seconds}. Plain data access must not call this.
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index 6924a55ee8536cfa128d5a718c63bbf216b43941..45c17b41a8a2d1623b94a9a313b23eeac64df95f 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -335,6 +335,11 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                 default:
+                     throw new IllegalStateException("Missing case for enum " + trackingRangeType);
+             }
++            // Kodama start - mob-lod tracking range
++            if (trackingRangeType == org.spigotmc.TrackingRange.TrackingRangeType.ANIMAL || trackingRangeType == org.spigotmc.TrackingRange.TrackingRangeType.MONSTER) {
++                configuredSpigotValue = Math.max(configuredSpigotValue, dev.kodama.entity.lod.MobLod.extendedTrackingRange(this.level));
++            }
++            // Kodama end - mob-lod tracking range
+             configuredSpigotValue = convertSpigotRangeToVanilla(configuredSpigotValue);
+ 
+             int trackRange = (configuredSpigotValue >>> 4) + ((configuredSpigotValue & 15) != 0 ? 1 : 0);
+diff --git a/src/main/java/net/minecraft/server/level/ServerEntity.java b/src/main/java/net/minecraft/server/level/ServerEntity.java
+index 58a3066d9b7cd71178aa9ca3c3310ec4c9eeba7c..107a06fcc7e06f42d046b7ce4156711c6d5703af 100644
+--- a/src/main/java/net/minecraft/server/level/ServerEntity.java
++++ b/src/main/java/net/minecraft/server/level/ServerEntity.java
+@@ -148,7 +148,7 @@ public class ServerEntity {
+             }
+         }
+ 
+-        if (this.forceStateResync || this.tickCount % this.updateInterval == 0 || this.entity.hasImpulse || this.entity.getEntityData().isDirty()) { // Paper - fix desync when a player is added to the tracker
++        if (this.forceStateResync || this.tickCount % (this.entity instanceof net.minecraft.world.entity.Mob kodamaMob ? dev.kodama.entity.lod.MobLod.updateInterval(kodamaMob, this.updateInterval) : this.updateInterval) == 0 || this.entity.hasImpulse || this.entity.getEntityData().isDirty()) { // Kodama - mob-lod far update interval // Paper - fix desync when a player is added to the tracker
+             int i;
+             int j;
+ 
+diff --git a/src/main/java/org/spigotmc/TrackingRange.java b/src/main/java/org/spigotmc/TrackingRange.java
+index e4425b242fe73d1fd2bd10c313aa16925432329f..f666e52c50e6ba7f78f4e2749cf7605f3ecd05bd 100644
+--- a/src/main/java/org/spigotmc/TrackingRange.java
++++ b/src/main/java/org/spigotmc/TrackingRange.java
+@@ -35,11 +35,11 @@ public class TrackingRange
+             case RAIDER:
+             case MONSTER:
+             case FLYING_MONSTER:
+-                return config.monsterTrackingRange;
++                return Math.max(config.monsterTrackingRange, dev.kodama.entity.lod.MobLod.extendedTrackingRange(entity.level())); // Kodama - mob-lod tracking range
+             case WATER:
+             case VILLAGER:
+             case ANIMAL:
+-                return config.animalTrackingRange;
++                return Math.max(config.animalTrackingRange, dev.kodama.entity.lod.MobLod.extendedTrackingRange(entity.level())); // Kodama - mob-lod tracking range
+             case MISC:
+         }
+         if ( entity instanceof ItemFrame || entity instanceof Painting || entity instanceof ItemEntity || entity instanceof ExperienceOrb )
