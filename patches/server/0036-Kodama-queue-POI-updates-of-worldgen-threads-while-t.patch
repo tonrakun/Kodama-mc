@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tonrakun <tonrakun@gmail.com>
+Date: Fri, 23 Oct 2026 08:30:57 +0900
+Subject: [PATCH] Kodama: queue POI updates of worldgen threads while the
+ server stops
+
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 85ae0a424a885fa207f8bc12496e6ae6dadb88d0..55713cb3824450cbcfa3334c89968d97d18ccff3 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -523,6 +523,17 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     public final io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader playerChunkLoader = new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader(this);
+     public final dev.kodama.entity.lod.MobLodManager kodamaMobLod = new dev.kodama.entity.lod.MobLodManager(this); // Kodama - mob-lod
+     public final dev.kodama.redstone.RedstoneMonitor kodamaRedstone = new dev.kodama.redstone.RedstoneMonitor(this); // Kodama - redstone
++    // Kodama start - while stopping, MinecraftServer#execute runs tasks at once on the calling thread, so a chunk that a
++    // worker still generates would touch the POI storage off-main; the queued POI change of such a chunk is redone from
++    // its blocks when it loads again
++    private void kodamaExecuteOnMain(final Runnable task) {
++        if (io.papermc.paper.util.TickThread.isTickThread()) {
++            this.getServer().execute(task);
++        } else {
++            this.getServer().tell(new net.minecraft.server.TickTask(this.getServer().getTickCount(), task));
++        }
++    }
++    // Kodama end
+     public final dev.kodama.hopper.HopperSleep kodamaHoppers = new dev.kodama.hopper.HopperSleep(this); // Kodama - hopper-sleep
+     private final java.util.concurrent.atomic.AtomicReference<io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances> viewDistances = new java.util.concurrent.atomic.AtomicReference<>(new io.papermc.paper.chunk.system.RegionizedPlayerChunkLoader.ViewDistances(-1, -1, -1));
+ 
+@@ -2241,13 +2252,13 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             BlockPos blockposition1 = pos.immutable();
+ 
+             optional.ifPresent((holder) -> {
+-                this.getServer().execute(() -> {
++                this.kodamaExecuteOnMain(() -> { // Kodama - queue even while stopping
+                     this.getPoiManager().remove(blockposition1);
+                     DebugPackets.sendPoiRemovedPacket(this, blockposition1);
+                 });
+             });
+             optional1.ifPresent((holder) -> {
+-                this.getServer().execute(() -> {
++                this.kodamaExecuteOnMain(() -> { // Kodama - queue even while stopping
+                     // Paper start - Remove stale POIs
+                     if (optional.isEmpty() && this.getPoiManager().exists(blockposition1, poiType -> true)) {
+                         this.getPoiManager().remove(blockposition1);
