@@ -1,8 +1,8 @@
 # Kodama testing tools
 
-- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, the plugin smoke test, the redstone monitoring test and the config GUI test.
+- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, the plugin smoke test, the redstone monitoring test, the config GUI test and the hopper idle sleep test.
 - `vanilla-diff/compare_worlds.py` - chunk-by-chunk Anvil comparer (Python 3, stdlib only).
-- `harness-plugin/` - server plugin that pre-generates worlds, records metrics and runs the plugin smoke test and the redstone test (driven by `-Dkodama.harness.*`).
+- `harness-plugin/` - server plugin that pre-generates worlds, records metrics and runs the plugin smoke test, the redstone test and the hopper tests (driven by `-Dkodama.harness.*`).
 
 Everything runs on Windows (Git Bash / PowerShell) and Linux. Requirements: Node 22+ (CI uses 24), Python 3, a Java 21 runtime.
 
@@ -171,6 +171,52 @@ Kodama only, without the harness plugin. One server run with two mineflayer bots
 
 Exit code is 1 if any check fails. Options: `--port` (25800), `--heap` (2G), `--java`, `--jvm-args`, `--view-distance`,
 `--simulation-distance`, `--keep-work`. Output goes to `testing/results/gui-<timestamp>/`: `console.log`, `report.json`, `report.md`.
+
+## Hopper idle sleep
+
+```sh
+cd testing/bench
+npm run hoppers
+```
+
+Paper and Kodama run one after the other, each on a fresh server directory. Kodama has `hoppers.idle-sleep` on. The test
+fails if the two servers differ in when items move.
+
+Parity (`hoppers` harness mode): in a void world with force loaded chunks the harness builds 15 contraptions, each in its
+own chunk, and runs them for 2400 ticks. Every container (chests, hoppers, furnace, minecarts, the composter level) is
+read at the end of every tick and logged whenever its contents change. The logs of both servers must be identical, tick
+for tick. The scenarios cover a hopper chain, a full chest emptied through the API and by a second hopper, a chest filled by
+a side hopper, item entities that are dropped, pushed by a piston, thrown into the suck area or lying 3 blocks away, a double
+chest filled through the half that is not over the hopper, chest and hopper minecarts above and in front of a hopper, a
+hopper locked by a lever, a composter and a furnace. A scenario also fails if nothing changes after its trigger tick
+(it would test nothing), and the Kodama run fails if no hopper ever fell asleep.
+
+The containers are read from block snapshots, because a plugin that opens the live Bukkit inventory of a container wakes
+the hoppers around it. The harness registers no listener for `InventoryMoveItemEvent`, `InventoryPickupItemEvent` or
+`HopperInventorySearchEvent`, which switch the feature off.
+
+Benchmark (`hoppers-bench` harness mode, skipped with `--no-bench`): a grid of 2000 hoppers that never move anything, half of
+them under empty chests and half facing full chests. After the warmup the harness measures MSPT with the usual metrics
+recorder, and on Kodama reads the `Hoppers` line of `/kodama status` for the number of sleeping hoppers.
+
+Exit code is 1 if any check fails. `--flavors paper,paper` runs Paper against itself as a baseline.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--flavors a,b` | `paper,kodama` | Servers to compare; the first one is the reference |
+| `--ticks` | 2400 | Ticks the parity scenarios run (at least 400, the later scenarios trigger up to tick 1000) |
+| `--no-bench` | off | Skip the micro benchmark |
+| `--bench-hoppers` | 2000 | Idle hoppers in the benchmark |
+| `--bench-warmup` / `--bench-duration` | 20 / 60 | Warmup and measured seconds of the benchmark |
+| `--port` | 25850 | Server port |
+| `--heap` | 2G | JVM `-Xms`/`-Xmx` |
+| `--view-distance` / `--simulation-distance` | 10 / 10 | Server settings |
+| `--java` | JAVA_HOME, then `java` | Java executable |
+| `--jvm-args` | - | Extra JVM arguments |
+| `--keep-work` | off | Keep the server directories in `testing/.work/` |
+
+Output goes to `testing/results/hoppers-<timestamp>/`: `<server>/console-hoppers.log` and `console-hoppers-bench.log`,
+`report.json` (with the change logs of every container) and `report.md` (also printed to stdout).
 
 ## compare_worlds.py
 

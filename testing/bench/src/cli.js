@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util';
 import { runBench } from './bench.js';
+import { runHoppers } from './hoppers.js';
 import { runGui } from './gui.js';
 import { runPlugins } from './plugins.js';
 import { runRedstone } from './redstone.js';
@@ -12,13 +13,14 @@ Commands:
   vanilla   Chunk generation parity check (Paper vs Kodama)
   plugins   Plugin compatibility smoke test (Paper vs Kodama)
   redstone  Redstone monitoring and per-chunk Alternate Current test (Kodama only)
+  hoppers   Hopper idle sleep parity test and micro benchmark (Paper vs Kodama)
   gui       In-game config GUI test with bots (Kodama only)
 
 Common options:
   --java <path>              Java executable (default: JAVA_HOME, then 'java')
-  --heap <size>              JVM heap, -Xms/-Xmx (bench: 10G, vanilla: 4G, plugins, redstone and gui: 2G)
+  --heap <size>              JVM heap, -Xms/-Xmx (bench: 10G, vanilla: 4G, plugins, redstone, gui and hoppers: 2G)
   --jvm-args "<args>"        Extra JVM arguments, whitespace separated
-  --port <n>                 Server port (25600, plugins: 25700, redstone: 25750, gui: 25800)
+  --port <n>                 Server port (25600, plugins: 25700, redstone: 25750, gui: 25800, hoppers: 25850)
   --view-distance <n>        (10)
   --simulation-distance <n>  (10)
 
@@ -62,6 +64,15 @@ redstone options:
   --measure <s>              Seconds the clock is measured on the world's implementation (70)
   --follow-up <s>            Seconds measured after each switch (20)
   --keep-work                Keep the server directory under testing/.work
+
+hoppers options:
+  --flavors a,b              Servers to compare (paper,kodama); paper,paper gives a baseline
+  --ticks <n>                Ticks the parity scenarios run (2400)
+  --no-bench                 Skip the micro benchmark
+  --bench-hoppers <n>        Idle hoppers in the benchmark (2000)
+  --bench-warmup <s>         (20)
+  --bench-duration <s>       (60)
+  --keep-work                Keep the server directories under testing/.work
 `;
 
 const options = {
@@ -98,6 +109,11 @@ const options = {
   parallel: { type: 'boolean' },
   measure: { type: 'string', default: '70' },
   'follow-up': { type: 'string', default: '20' },
+  ticks: { type: 'string', default: '2400' },
+  'no-bench': { type: 'boolean' },
+  'bench-hoppers': { type: 'string', default: '2000' },
+  'bench-warmup': { type: 'string', default: '20' },
+  'bench-duration': { type: 'string', default: '60' },
 };
 
 function number(values, name, { min = 0, integer = true } = {}) {
@@ -179,6 +195,18 @@ async function main() {
   if (command === 'gui') {
     return runGui({
       ...commonOptions(values, '2G', '25800'),
+      keepWork: Boolean(values['keep-work']),
+    });
+  }
+  if (command === 'hoppers') {
+    return runHoppers({
+      ...commonOptions(values, '2G', '25850'),
+      flavors: values.flavors,
+      ticks: number(values, 'ticks', { min: 400 }),
+      bench: !values['no-bench'],
+      benchHoppers: number(values, 'bench-hoppers', { min: 1 }),
+      benchWarmup: number(values, 'bench-warmup', { min: 0 }),
+      benchDuration: number(values, 'bench-duration', { min: 1 }),
       keepWork: Boolean(values['keep-work']),
     });
   }

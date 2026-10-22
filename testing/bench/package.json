@@ -12,6 +12,7 @@
     "vanilla": "node src/cli.js vanilla",
     "plugins": "node src/cli.js plugins",
     "redstone": "node src/cli.js redstone",
+    "hoppers": "node src/cli.js hoppers",
     "gui": "node src/cli.js gui"
   },
   "dependencies": {

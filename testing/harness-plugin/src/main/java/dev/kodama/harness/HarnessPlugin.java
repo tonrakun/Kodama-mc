@@ -72,6 +72,10 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
             smoke.begin(intProp("joinTimeout", 120));
         } else if ("redstone".equals(mode) || "redstone-verify".equals(mode)) {
             new RedstoneTest(this, outDir, "redstone-verify".equals(mode), intProp("redstoneSeconds", 70), intProp("followUpSeconds", 20)).begin();
+        } else if ("hoppers".equals(mode)) {
+            new HopperTest(this, outDir, intProp("hopperTicks", 2400)).begin();
+        } else if ("hoppers-bench".equals(mode)) {
+            new HopperBench(this, outDir, intProp("hopperCount", 2000), intProp("warmup", 20), intProp("duration", 60)).begin();
         }
     }
 
