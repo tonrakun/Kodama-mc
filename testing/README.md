@@ -1,8 +1,8 @@
 # Kodama testing tools
 
-- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, and the vanilla-parity driver.
+- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, and the plugin smoke test.
 - `vanilla-diff/compare_worlds.py` - chunk-by-chunk Anvil comparer (Python 3, stdlib only).
-- `harness-plugin/` - server plugin that pre-generates worlds and records metrics (driven by `-Dkodama.harness.*`).
+- `harness-plugin/` - server plugin that pre-generates worlds, records metrics and runs the plugin smoke test (driven by `-Dkodama.harness.*`).
 
 Everything runs on Windows (Git Bash / PowerShell) and Linux. Requirements: Node 22+ (CI uses 24), Python 3, a Java 21 runtime.
 
@@ -76,6 +76,39 @@ Features (ores, plants, deltas...) spill into neighbouring chunks, so with paral
 depends on the order chunks are generated in and even two Paper runs differ.
 
 Output goes to `testing/results/vanilla-<timestamp>/`: `parity.md` and one `compare-<seed>.json` per seed.
+
+## Plugin compatibility
+
+```sh
+cd testing/bench
+npm run plugins
+```
+
+For each flavor a fresh server starts with the plugins from `bench/plugins.json` (LuckPerms, WorldEdit, EssentialsX,
+ProtocolLib, ViaVersion), the harness in `smoke` mode and one bot. The bot sends a few plugin commands as chat; the
+harness lists the plugins, runs console commands and writes `smoke.json`. On Kodama it also checks that
+
+- a mob in a reduced Mob LOD tier is promoted to NEAR in the same tick by a plugin API call (`Mob#getTarget`), and
+- the chunk packet cache is off while ProtocolLib is enabled.
+
+The jars are downloaded into `testing/.cache/plugins/` and checked against the sha512 in `plugins.json`.
+Each console.log is scanned for ERROR lines and exception starts, which are normalized and compared between the flavors.
+
+Exit code is 1 if a plugin is enabled on Paper but not on Kodama, a command threw on Kodama but not on Paper,
+a Kodama check failed, or there are error lines only in Kodama.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--flavors a,b` | `paper,kodama` | Servers to run; comparisons need both |
+| `--port` | 25700 | Server port |
+| `--heap` | 2G | JVM `-Xms`/`-Xmx` |
+| `--view-distance` / `--simulation-distance` | 10 / 10 | Server settings |
+| `--java` | JAVA_HOME, then `java` | Java executable |
+| `--jvm-args` | - | Extra JVM arguments |
+| `--keep-work` | off | Keep server directories in `testing/.work/` |
+
+Output goes to `testing/results/plugins-<timestamp>/`: `paper/` and `kodama/` (each with `smoke.json` and
+`console.log`), `report.json` and `report.md` (also printed to stdout).
 
 ## compare_worlds.py
 

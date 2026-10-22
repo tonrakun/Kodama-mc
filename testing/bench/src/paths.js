@@ -8,3 +8,4 @@ export const WORK = join(TESTING, '.work');
 export const RESULTS = join(TESTING, 'results');
 export const COMPARER = join(TESTING, 'vanilla-diff', 'compare_worlds.py');
 export const SWARM_SCRIPT = join(TESTING, 'bench', 'src', 'swarm.js');
+export const PLUGIN_LIST = join(TESTING, 'bench', 'plugins.json');

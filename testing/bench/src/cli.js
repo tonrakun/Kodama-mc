@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util';
 import { runBench } from './bench.js';
+import { runPlugins } from './plugins.js';
 import { runVanilla } from './vanilla.js';
 
 const USAGE = `Usage: node src/cli.js <command> [options]
@@ -7,12 +8,13 @@ const USAGE = `Usage: node src/cli.js <command> [options]
 Commands:
   bench     Paper vs Kodama performance benchmark with a bot swarm
   vanilla   Chunk generation parity check (Paper vs Kodama)
+  plugins   Plugin compatibility smoke test (Paper vs Kodama)
 
 Common options:
   --java <path>              Java executable (default: JAVA_HOME, then 'java')
-  --heap <size>              JVM heap, -Xms/-Xmx (bench: 10G, vanilla: 4G)
+  --heap <size>              JVM heap, -Xms/-Xmx (bench: 10G, vanilla: 4G, plugins: 2G)
   --jvm-args "<args>"        Extra JVM arguments, whitespace separated
-  --port <n>                 Server port (25600)
+  --port <n>                 Server port (25600, plugins: 25700)
   --view-distance <n>        (10)
   --simulation-distance <n>  (10)
 
@@ -44,6 +46,10 @@ vanilla options:
   --keep-worlds              Keep work dirs after a passing seed
   --flavors a,b              Servers to compare (paper,kodama); paper,paper gives a baseline
   --parallel                 Generate with Paper's default worker threads (order-dependent, not comparable)
+
+plugins options:
+  --flavors a,b              Servers to run (paper,kodama); the plugins come from bench/plugins.json
+  --keep-work                Keep the server directories under testing/.work
 `;
 
 const options = {
@@ -51,7 +57,7 @@ const options = {
   java: { type: 'string' },
   heap: { type: 'string' },
   'jvm-args': { type: 'string' },
-  port: { type: 'string', default: '25600' },
+  port: { type: 'string' },
   'view-distance': { type: 'string', default: '10' },
   'simulation-distance': { type: 'string', default: '10' },
   server: { type: 'string', default: 'both' },
@@ -88,12 +94,12 @@ function number(values, name, { min = 0, integer = true } = {}) {
   return n;
 }
 
-function commonOptions(v, defaultHeap) {
+function commonOptions(v, defaultHeap, defaultPort = '25600') {
   return {
     java: v.java,
     heap: v.heap ?? defaultHeap,
     jvmArgs: v['jvm-args'] ? v['jvm-args'].split(/\s+/).filter(Boolean) : [],
-    port: number(v, 'port', { min: 1 }),
+    port: number({ port: v.port ?? defaultPort }, 'port', { min: 1 }),
     viewDistance: number(v, 'view-distance', { min: 2 }),
     simulationDistance: number(v, 'simulation-distance', { min: 2 }),
   };
@@ -139,6 +145,13 @@ async function main() {
       keepWorlds: Boolean(values['keep-worlds']),
       flavors: values.flavors,
       parallel: Boolean(values.parallel),
+    });
+  }
+  if (command === 'plugins') {
+    return runPlugins({
+      ...commonOptions(values, '2G', '25700'),
+      flavors: values.flavors,
+      keepWork: Boolean(values['keep-work']),
     });
   }
   console.error(`Unknown command '${command}'\n\n${USAGE}`);

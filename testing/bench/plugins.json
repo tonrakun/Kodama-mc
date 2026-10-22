@@ -1,0 +1,32 @@
+[
+  {
+    "name": "LuckPerms",
+    "file": "LuckPerms-Bukkit-5.5.71.jar",
+    "url": "https://cdn.modrinth.com/data/Vebnzrzj/versions/b0mk8uS6/LuckPerms-Bukkit-5.5.71.jar",
+    "sha512": "188a91f0a543d23bfda32385fca6db63d61e49c8a422bd452a260bd9cbc6a7d7fe45071199e9fca8f3ce43c2b41ee84fd315bd15464577028ff3951a7d4fab27"
+  },
+  {
+    "name": "WorldEdit",
+    "file": "worldedit-bukkit-7.3.9.jar",
+    "url": "https://cdn.modrinth.com/data/1u6JkXh5/versions/Bu1zaaoc/worldedit-bukkit-7.3.9.jar",
+    "sha512": "ce19097ab93a3ff75a929a1efec58138adc5b700f876ec8ac7a96c97d98d77a06f22661f0418c3407d644ca2d9713fde417d5789c79864d9c2094f203f372c76"
+  },
+  {
+    "name": "Essentials",
+    "file": "EssentialsX-2.21.2.jar",
+    "url": "https://cdn.modrinth.com/data/hXiIvTyT/versions/Oa9ZDzZq/EssentialsX-2.21.2.jar",
+    "sha512": "0571b015dce84cf03e906c2d498e8bc3827d86debafafb89851517a76c3eec0391b9bb90f6ec4a5f0dbf4c18bee84ead5e354fc0a5be0cc567fdaa9fc8d96c15"
+  },
+  {
+    "name": "ProtocolLib",
+    "file": "ProtocolLib-5.3.0.jar",
+    "url": "https://github.com/dmulloy2/ProtocolLib/releases/download/5.3.0/ProtocolLib.jar",
+    "sha512": "c639a7c7fd6188a985c848dd6667e184a14a195a8bec07021385147f28cfae67dd3f8c18d51b200b63b740f4f5621d7ed0d2591aa250d0189daf1369226feb79"
+  },
+  {
+    "name": "ViaVersion",
+    "file": "ViaVersion-5.12.1.jar",
+    "url": "https://cdn.modrinth.com/data/P1OZGk5p/versions/5WgnasGG/ViaVersion-5.12.1.jar",
+    "sha512": "b2e5c03689e2265410613a928640076cfcd576e7a3dc7ca1276a76dbe624f2f5467348c3b3eaf8b5987ed7662afb93cc5cb9373035f4c5512884116e4bb6add9"
+  }
+]

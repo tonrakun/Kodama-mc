@@ -15,6 +15,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public final class HarnessPlugin extends JavaPlugin implements Listener {
@@ -25,6 +26,7 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
     private MetricsRecorder metrics;
     private Pregenerator pregen;
     private TrapTower tower;
+    private SmokeTest smoke;
 
     @Override
     public void onEnable() {
@@ -65,6 +67,9 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
             metrics = new MetricsRecorder(this, outDir, intProp("warmup", 30), intProp("duration", 120),
                     Boolean.parseBoolean(System.getProperty(P + "autostop", "true")));
             metrics.begin();
+        } else if ("smoke".equals(mode)) {
+            smoke = new SmokeTest(this, outDir, botPrefix, listProp("commands"), intProp("botCommands", 0));
+            smoke.begin(intProp("joinTimeout", 120));
         }
     }
 
@@ -77,6 +82,9 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
             p.setOp(true);
             if (tower != null) {
                 tower.park(p);
+            }
+            if (smoke != null) {
+                smoke.onBotJoin(p);
             }
         }
     }
@@ -92,6 +100,15 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
             getLogger().warning("Bad value for " + P + key + ": " + v + " (using " + def + ")");
             return def;
         }
+    }
+
+    /** Items are separated by a semicolon because commands contain spaces and commas. */
+    private List<String> listProp(String key) {
+        String v = System.getProperty(P + key);
+        if (v == null || v.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(v.split(";")).map(String::trim).filter(s -> !s.isEmpty()).toList();
     }
 
     private List<World> selectWorlds() {
