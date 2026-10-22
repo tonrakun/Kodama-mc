@@ -50,7 +50,8 @@ A feature that keeps throwing exceptions is switched off on its own while the se
 server with the recommended JVM flags. Copy the script next to the server jar.
 
 - `MEMORY` / `-Memory`: heap size (default `4G`)
-- `GC` / `-Gc`: `g1` (default, Aikar's flags) or `zgc` (generational ZGC)
+- `GC` / `-Gc`: `auto` (default: `zgc` from a 6G heap, else `g1`), `g1` (Aikar's flags) or `zgc` (generational ZGC).
+  In the benchmark (JDK 25, 20 bots, 6G) ZGC had 1 ms GC pauses and 1-6 ticks over 50 ms against 10-17 with G1, but used about 20% more heap
 - Compact Object Headers are turned on with JDK 24 or newer (JDK 25 is recommended)
 
 ## Working with patches

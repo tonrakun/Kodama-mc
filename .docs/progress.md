@@ -29,7 +29,7 @@
 | §3 | 赤石 (装置分類・チャンク単位 Alternate Current) | 完了。チャンク単位の更新回数から一時型・常時型・異常常時型を判定して通知、`/kodama redstone set` で切替 (チャンクの PDC に保存) | `0031`, `npm run redstone` |
 | §3.3 | ホッパー: イベント省略 | Paper に既存 (`skipHopperEvents`) | |
 | §3.3 | ホッパー: アイドル休眠 | 実装済み。依存するブロック・インベントリ・エンティティセクションの変化で起こす。ホッパー系イベントのリスナーがいる間は無効 | `0032`, `npm run hoppers` |
-| §5 | JVM 推奨設定の起動スクリプト | 完了 (G1 と世代別 ZGC を選択可、JDK 24+ で Compact Object Headers)。既定 GC を決めるベンチは未実施 | `scripts/` |
+| §5 | JVM 推奨設定の起動スクリプト | 完了 (G1 と世代別 ZGC を選択可、JDK 24+ で Compact Object Headers)。既定は `auto` (ヒープ 6G 以上で ZGC)。JDK 25・mixed 20 体・6G で ZGC は GC 停止 1ms、50ms 超え 1〜6 回 (G1 は 10〜17 回)、ヒープ約 +20% | `scripts/` |
 
 ## 計測で分かったこと
 
@@ -51,7 +51,6 @@
 
 ## 次にやること (順番)
 
-1. §5 の既定 GC を決めるベンチ (G1 / 世代別 ZGC、JDK 25)。スクリプトの下書きあり (G1 は `scripts/start.sh` と同じフラグ)
 2. Mob LOD 第2段階 (§1.1 遠距離、§1.2、§1.6) と、遠距離 Mob の追跡範囲拡大・送信頻度低下。Mob AI はメインスレッドの 3〜5% しかないので MSPT への効果は小さい見込み
 3. Leaf の残り候補: 0041 Multithreaded Tracker と 0083/0084 (ProtocolLib 互換リスクあり、既定は aggressive のみを想定)
 4. §2.4 生成の SIMD 化 (バニラと完全一致が条件)

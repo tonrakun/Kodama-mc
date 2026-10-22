@@ -1,13 +1,13 @@
 # Starts a Kodama server with the recommended JVM flags.
 #
-#   .\start.ps1                       G1, 4G heap, newest kodama-paperclip-*.jar in this directory
+#   .\start.ps1                       4G heap (G1), newest kodama-paperclip-*.jar in this directory
 #   .\start.ps1 -Memory 10G -Gc zgc   generational ZGC, 10G heap
 #
 # Arguments after the named parameters are passed to the server.
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Memory = "4G",
-    [ValidateSet("g1", "zgc")][string]$Gc = "g1",
+    [ValidateSet("auto", "g1", "zgc")][string]$Gc = "auto",
     [string]$Java = $(if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME "bin\java.exe" } else { "java" }),
     [string]$Jar = "",
     [string]$ExtraJvmArgs = "",
@@ -33,6 +33,9 @@ if ($javaMajor -lt 21) { Write-Error "Java 21 or newer is required, found: $vers
 $heapGb = if ($Memory -match '^(\d+)[Mm]$') { [int]$Matches[1] / 1024 } elseif ($Memory -match '^(\d+)') { [int]$Matches[1] } else { 0 }
 
 $flags = @("-Xms$Memory", "-Xmx$Memory", "-XX:+AlwaysPreTouch", "-XX:+DisableExplicitGC", "-XX:+PerfDisableSharedMem")
+
+# zgc had fewer slow ticks in the Kodama benchmark but needs about 20% more heap
+if ($Gc -eq "auto") { $Gc = if ($heapGb -ge 6) { "zgc" } else { "g1" } }
 
 if ($Gc -eq "g1") {
     # Aikar's flags; the young generation and regions grow with the heap above 12G

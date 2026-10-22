@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Starts a Kodama server with the recommended JVM flags.
 #
-#   ./start.sh                     G1, 4G heap, newest kodama-paperclip-*.jar in this directory
-#   MEMORY=10G GC=zgc ./start.sh   generational ZGC, 10G heap
+#   ./start.sh                     4G heap (G1), newest kodama-paperclip-*.jar in this directory
+#   MEMORY=10G GC=zgc ./start.sh   generational ZGC (also picked by GC=auto from 6G), 10G heap
 #
-# Environment: MEMORY (heap, default 4G), GC (g1 | zgc, default g1), JAVA (java binary),
+# Environment: MEMORY (heap, default 4G), GC (auto | g1 | zgc, default auto:
+# zgc from 6G heap, which had fewer slow ticks in the Kodama benchmark but needs about 20% more heap, else g1), JAVA (java binary),
 # JAR (server jar), EXTRA_JVM_ARGS. Arguments are passed to the server.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 MEMORY="${MEMORY:-4G}"
-GC="${GC:-g1}"
+GC="${GC:-auto}"
 JAVA="${JAVA:-${JAVA_HOME:+$JAVA_HOME/bin/}java}"
 JAR="${JAR:-$(ls -t kodama-paperclip-*.jar 2>/dev/null | head -n 1)}"
 
@@ -34,6 +35,10 @@ heap_gb() {
   esac
 }
 
+if [ "$GC" = auto ]; then
+  if [ "$(heap_gb)" -ge 6 ]; then GC=zgc; else GC=g1; fi
+fi
+
 flags=("-Xms$MEMORY" "-Xmx$MEMORY" -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+PerfDisableSharedMem)
 
 case "$GC" in
@@ -54,7 +59,7 @@ case "$GC" in
     if [ "$java_major" -lt 23 ]; then flags+=(-XX:+ZGenerational); fi
     ;;
   *)
-    echo "GC must be g1 or zgc, got: $GC" >&2
+    echo "GC must be auto, g1 or zgc, got: $GC" >&2
     exit 1
     ;;
 esac
