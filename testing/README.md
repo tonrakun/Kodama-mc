@@ -1,8 +1,8 @@
 # Kodama testing tools
 
-- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, and the plugin smoke test.
+- `bench/` - Node.js runner: Paper vs Kodama benchmark with mineflayer bots, the vanilla-parity driver, the plugin smoke test and the redstone monitoring test.
 - `vanilla-diff/compare_worlds.py` - chunk-by-chunk Anvil comparer (Python 3, stdlib only).
-- `harness-plugin/` - server plugin that pre-generates worlds, records metrics and runs the plugin smoke test (driven by `-Dkodama.harness.*`).
+- `harness-plugin/` - server plugin that pre-generates worlds, records metrics and runs the plugin smoke test and the redstone test (driven by `-Dkodama.harness.*`).
 
 Everything runs on Windows (Git Bash / PowerShell) and Linux. Requirements: Node 22+ (CI uses 24), Python 3, a Java 21 runtime.
 
@@ -109,6 +109,47 @@ a Kodama check failed, or there are error lines only in Kodama.
 
 Output goes to `testing/results/plugins-<timestamp>/`: `paper/` and `kodama/` (each with `smoke.json` and
 `console.log`), `report.json` and `report.md` (also printed to stdout).
+
+## Redstone monitoring
+
+```sh
+cd testing/bench
+npm run redstone
+```
+
+Kodama only. Two server runs on the same server directory, with `redstone.notify-updates-per-second=5` in the world defaults.
+The harness builds a void world with a two observer clock in chunk A (driving a line of 10 redstone dust into a lamp) and
+a single lever pull in chunk B, both force loaded.
+
+Run 1 (`redstone` mode) measures the clock for 70 s, reads `/kodama redstone info` for both chunks and `top`, switches
+chunk A to Alternate Current and measures it for 20 s more. Run 2 (`redstone-verify` mode) restarts on the same world and
+checks that chunk A still uses Alternate Current and that the clock runs at the same rate, then switches it back to the
+world implementation. The checks are
+
+- chunk A is `continuous (clock)`, chunk B is `transient` or idle, `top` lists chunk A first, and the console has the
+  "Redstone clock at" warning for chunk A,
+- the switch shows in `info` within 15 s, and the clock rate with Alternate Current and after the restart is within 10% of
+  the rate on the world implementation,
+- the clock still runs after switching back.
+
+The rate is the number of changes per game second of the power of the last dust before the lamp. The lamp itself stays lit,
+because it turns off 4 ticks after it lost power and the clock's off phase is shorter.
+
+Exit code is 1 if any check fails.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--measure` | 70 | Seconds measured on the world's implementation; the chunk needs 45 active seconds to count as a clock, so keep it at 50 or more |
+| `--follow-up` | 20 | Seconds measured after each switch |
+| `--port` | 25750 | Server port |
+| `--heap` | 2G | JVM `-Xms`/`-Xmx` |
+| `--view-distance` / `--simulation-distance` | 10 / 10 | Server settings |
+| `--java` | JAVA_HOME, then `java` | Java executable |
+| `--jvm-args` | - | Extra JVM arguments |
+| `--keep-work` | off | Keep the server directory in `testing/.work/` |
+
+Output goes to `testing/results/redstone-<timestamp>/`: `console-redstone.log` and `console-redstone-verify.log`,
+`report.json` and `report.md` (also printed to stdout).
 
 ## compare_worlds.py
 

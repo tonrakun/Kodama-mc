@@ -70,6 +70,8 @@ public final class HarnessPlugin extends JavaPlugin implements Listener {
         } else if ("smoke".equals(mode)) {
             smoke = new SmokeTest(this, outDir, botPrefix, listProp("commands"), intProp("botCommands", 0));
             smoke.begin(intProp("joinTimeout", 120));
+        } else if ("redstone".equals(mode) || "redstone-verify".equals(mode)) {
+            new RedstoneTest(this, outDir, "redstone-verify".equals(mode), intProp("redstoneSeconds", 70), intProp("followUpSeconds", 20)).begin();
         }
     }
 

@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 import { runBench } from './bench.js';
 import { runPlugins } from './plugins.js';
+import { runRedstone } from './redstone.js';
 import { runVanilla } from './vanilla.js';
 
 const USAGE = `Usage: node src/cli.js <command> [options]
@@ -9,12 +10,13 @@ Commands:
   bench     Paper vs Kodama performance benchmark with a bot swarm
   vanilla   Chunk generation parity check (Paper vs Kodama)
   plugins   Plugin compatibility smoke test (Paper vs Kodama)
+  redstone  Redstone monitoring and per-chunk Alternate Current test (Kodama only)
 
 Common options:
   --java <path>              Java executable (default: JAVA_HOME, then 'java')
-  --heap <size>              JVM heap, -Xms/-Xmx (bench: 10G, vanilla: 4G, plugins: 2G)
+  --heap <size>              JVM heap, -Xms/-Xmx (bench: 10G, vanilla: 4G, plugins and redstone: 2G)
   --jvm-args "<args>"        Extra JVM arguments, whitespace separated
-  --port <n>                 Server port (25600, plugins: 25700)
+  --port <n>                 Server port (25600, plugins: 25700, redstone: 25750)
   --view-distance <n>        (10)
   --simulation-distance <n>  (10)
 
@@ -50,6 +52,11 @@ vanilla options:
 plugins options:
   --flavors a,b              Servers to run (paper,kodama); the plugins come from bench/plugins.json
   --keep-work                Keep the server directories under testing/.work
+
+redstone options:
+  --measure <s>              Seconds the clock is measured on the world's implementation (70)
+  --follow-up <s>            Seconds measured after each switch (20)
+  --keep-work                Keep the server directory under testing/.work
 `;
 
 const options = {
@@ -84,6 +91,8 @@ const options = {
   'keep-worlds': { type: 'boolean' },
   flavors: { type: 'string', default: 'paper,kodama' },
   parallel: { type: 'boolean' },
+  measure: { type: 'string', default: '70' },
+  'follow-up': { type: 'string', default: '20' },
 };
 
 function number(values, name, { min = 0, integer = true } = {}) {
@@ -151,6 +160,14 @@ async function main() {
     return runPlugins({
       ...commonOptions(values, '2G', '25700'),
       flavors: values.flavors,
+      keepWork: Boolean(values['keep-work']),
+    });
+  }
+  if (command === 'redstone') {
+    return runRedstone({
+      ...commonOptions(values, '2G', '25750'),
+      measure: number(values, 'measure', { min: 50 }),
+      followUp: number(values, 'follow-up', { min: 1 }),
       keepWork: Boolean(values['keep-work']),
     });
   }

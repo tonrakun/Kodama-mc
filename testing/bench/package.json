@@ -10,7 +10,8 @@
   "scripts": {
     "bench": "node src/cli.js bench",
     "vanilla": "node src/cli.js vanilla",
-    "plugins": "node src/cli.js plugins"
+    "plugins": "node src/cli.js plugins",
+    "redstone": "node src/cli.js redstone"
   },
   "dependencies": {
     "mineflayer": "^4.39.0"
