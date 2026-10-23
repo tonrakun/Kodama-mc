@@ -1,0 +1,52 @@
+diff --git a/src/main/java/net/minecraft/world/level/NaturalSpawner.java b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+index e4df61add..8595cc852 100644
+--- a/src/main/java/net/minecraft/world/level/NaturalSpawner.java
++++ b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+@@ -254,10 +254,9 @@ public final class NaturalSpawner {
+                             blockposition_mutableblockposition.set(l, i, i1);
+                             double d0 = (double) l + 0.5D;
+                             double d1 = (double) i1 + 0.5D;
+-                            Player entityhuman = world.getNearestPlayer(d0, (double) i, d1, -1.0D, false);
++                            double d2 = NaturalSpawner.kodamaNearestPlayerDistanceSqr(world, d0, (double) i, d1); // Kodama
+ 
+-                            if (entityhuman != null) {
+-                                double d2 = entityhuman.distanceToSqr(d0, (double) i, d1);
++                            if (d2 >= 0.0D) { // Kodama
+ 
+                                 if (world.isLoadedAndInBounds(blockposition_mutableblockposition) && NaturalSpawner.isRightDistanceToPlayerAndSpawnPoint(world, chunk, blockposition_mutableblockposition, d2)) { // Paper - don't load chunks for mob spawn
+                                     if (biomesettingsmobs_c == null) {
+@@ -332,6 +331,34 @@ public final class NaturalSpawner {
+         return j; // Paper - Optional per player mob spawns
+     }
+ 
++    // Kodama start - only the distance to the nearest player is used, and a player outside Paper's GENERAL nearby area
++    // (33 chunks) is at least 528 blocks away, so a nearer player found there is the nearest of all
++    private static final double KODAMA_NEARBY_EXACT_DISTANCE_SQR = 256.0D * 256.0D; // margin for player positions Paper has not tracked yet
++
++    private static double kodamaNearestPlayerDistanceSqr(ServerLevel world, double x, double y, double z) {
++        com.destroystokyo.paper.util.maplist.ReferenceList<net.minecraft.server.level.ServerPlayer> nearby = world.chunkSource.chunkMap.getNearbyPlayers()
++            .getPlayersByBlock(Mth.floor(x), Mth.floor(z), io.papermc.paper.util.player.NearbyPlayers.NearbyMapType.GENERAL);
++        if (nearby != null) {
++            double nearest = -1.0D;
++            Object[] raw = nearby.getRawData();
++            for (int index = 0, size = nearby.size(); index < size; ++index) {
++                net.minecraft.server.level.ServerPlayer player = (net.minecraft.server.level.ServerPlayer) raw[index];
++                if (!player.isSpectator()) {
++                    double distance = player.distanceToSqr(x, y, z);
++                    if (nearest == -1.0D || distance < nearest) {
++                        nearest = distance;
++                    }
++                }
++            }
++            if (nearest != -1.0D && nearest < KODAMA_NEARBY_EXACT_DISTANCE_SQR) {
++                return nearest;
++            }
++        }
++        Player player = world.getNearestPlayer(x, y, z, -1.0D, false);
++        return player == null ? -1.0D : player.distanceToSqr(x, y, z);
++    }
++    // Kodama end
++
+     private static boolean isRightDistanceToPlayerAndSpawnPoint(ServerLevel world, ChunkAccess chunk, BlockPos.MutableBlockPos pos, double squaredDistance) {
+         return squaredDistance <= 576.0D ? false : (world.getSharedSpawnPos().closerToCenterThan(new Vec3((double) pos.getX() + 0.5D, (double) pos.getY(), (double) pos.getZ() + 0.5D), 24.0D) ? false : Objects.equals(new ChunkPos(pos), chunk.getPos()) || world.isNaturalSpawningAllowed((BlockPos) pos));
+     }
